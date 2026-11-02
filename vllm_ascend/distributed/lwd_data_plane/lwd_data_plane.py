@@ -42,6 +42,7 @@ class LwdDataPlane:
         # seqno counter, and merging connections would collide their
         # independent seqno streams.
         self._queues: dict[tuple[ConnectionId, LwdChannelType, str], LwdTransferQueue] = {}
+        self._pending_skips: dict[tuple[ConnectionId, LwdChannelType, str], set[int]] = {}
         self._lock = threading.Lock()
         self._shutting_down = False
         self._failed_connections: set[ConnectionId] = set()
@@ -93,10 +94,15 @@ class LwdDataPlane:
         passes op="recv"; the sender-side abort glue passes op="send".  Both
         peers must skip the same seqnos."""
         connection = connection_id or ConnectionId(edge_id, cloud_id, dp_idx)
+        key = (connection, channel_type, op)
         with self._lock:
-            queue = self._queues.get((connection, channel_type, op))
-        if queue is not None:
-            queue.skip_seqno(seqno)
+            queue = self._queues.get(key)
+            if queue is None:
+                # Abort control can arrive before the first data submission.
+                # Keep the hole until this FIFO is created instead of losing it.
+                self._pending_skips.setdefault(key, set()).add(seqno)
+                return
+        queue.skip_seqno(seqno)
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
@@ -108,6 +114,9 @@ class LwdDataPlane:
             self._failed_connections.add(connection)
             keys = [key for key in self._queues if key[0] == connection]
             queues = [self._queues.pop(key) for key in keys]
+            for key in list(self._pending_skips):
+                if key[0] == connection:
+                    self._pending_skips.pop(key, None)
         for queue in queues:
             queue.abort(error)
         logger.warning("[LWD] aborted data-plane connection %s: %r", connection, error)
@@ -124,6 +133,7 @@ class LwdDataPlane:
         finally:
             with self._lock:
                 self._queues.clear()
+                self._pending_skips.clear()
                 self._failed_connections.clear()
                 self._shutting_down = False
         logger.info("[lwd-comm] service shut down")
@@ -143,6 +153,8 @@ class LwdDataPlane:
             if queue is None:
                 queue = LwdTransferQueue(request.connection, request.channel, request.op)
                 self._queues[key] = queue
+                for seqno in sorted(self._pending_skips.pop(key, ())):
+                    queue.skip_seqno(seqno)
         return queue.submit(request)
 
 
