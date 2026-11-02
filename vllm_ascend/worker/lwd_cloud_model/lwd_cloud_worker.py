@@ -220,6 +220,7 @@ class LwdCloudWorker(LwdWorkerBase):
         self._early_recv_max_inflight = _LWD_EARLY_RECV_MAX_INFLIGHT
         self._early_recv_futures: dict[tuple[ConnectionId, LwdChannelType, int], LwdTransferFuture] = {}
         self._early_recv_pending: dict[tuple[ConnectionId, LwdChannelType, int], dict[str, Any]] = {}
+        self._early_recv_reserved: set[tuple[ConnectionId, LwdChannelType, int]] = set()
         self._early_recv_last_delivered: dict[ConnectionId, int] = {}
         self._early_recv_failed_connections: set[ConnectionId] = set()
         self._early_recv_current_key: tuple[ConnectionId, LwdChannelType, int] | None = None
@@ -355,7 +356,11 @@ class LwdCloudWorker(LwdWorkerBase):
         key = self._early_recv_current_key
         if key is not None and key[0] == connection:
             return key[2]
-        candidates = [key[2] for key in (*self._early_recv_futures, *self._early_recv_pending) if key[0] == connection]
+        candidates = [
+            key[2]
+            for key in (*self._early_recv_futures, *self._early_recv_reserved, *self._early_recv_pending)
+            if key[0] == connection
+        ]
         return min(candidates) if candidates else -1
 
     def _lwd_fail_early_recv_connection(self, connection: ConnectionId, seqno: int, exc: Exception) -> None:
@@ -364,6 +369,9 @@ class LwdCloudWorker(LwdWorkerBase):
             if connection in self._early_recv_failed_connections:
                 return
             self._early_recv_failed_connections.add(connection)
+            for key in list(self._early_recv_reserved):
+                if key[0] == connection:
+                    self._early_recv_reserved.discard(key)
             for key in list(self._early_recv_pending):
                 if key[0] == connection:
                     self._early_recv_pending.pop(key, None)
@@ -448,6 +456,7 @@ class LwdCloudWorker(LwdWorkerBase):
             if (
                 fields.seqno <= self._early_recv_last_delivered.get(fields.connection, -1)
                 or key in self._early_recv_futures
+                or key in self._early_recv_reserved
                 or key in self._early_recv_pending
             ):
                 return
@@ -502,7 +511,7 @@ class LwdCloudWorker(LwdWorkerBase):
         start = self._early_recv_rr % len(connections)
         ordered = connections[start:] + connections[:start]
         counts: dict[ConnectionId, int] = {connection: 0 for connection in connections}
-        for connection, _channel, _seqno in self._early_recv_futures:
+        for connection, _channel, _seqno in (*self._early_recv_futures, *self._early_recv_reserved):
             counts[connection] = counts.get(connection, 0) + 1
         selected = next((connection for connection in ordered if counts.get(connection, 0) < quota), None)
         if selected is None:
@@ -512,14 +521,13 @@ class LwdCloudWorker(LwdWorkerBase):
         return key, self._early_recv_pending[key]
 
     def _early_recv_pump(self) -> None:
-        """Submit independent connection FIFOs without cross-connection HOL blocking."""
+        """Reserve under lock, then submit independent FIFOs without cross-connection HOL blocking."""
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import hint_fields
 
         blocked: set[ConnectionId] = set()
         while True:
-            failure: Exception | None = None
             with self._early_recv_lock:
-                if len(self._early_recv_futures) >= self._early_recv_max_inflight:
+                if len(self._early_recv_futures) + len(self._early_recv_reserved) >= self._early_recv_max_inflight:
                     return
                 picked = self._pick_pending_locked(blocked)
                 if picked is None:
@@ -527,27 +535,49 @@ class LwdCloudWorker(LwdWorkerBase):
                 key, hint = picked
                 fields = hint_fields(hint)
                 assert fields is not None
+                self._early_recv_pending.pop(key)
+                self._early_recv_reserved.add(key)
                 self._early_recv_current_key = key
-                try:
-                    future = self._lwd_submit_early_recv(fields)
-                except LwdHostStageSlotBusy:
-                    self._early_recv_current_key = None
-                    blocked.add(fields.connection)
-                    continue
-                except Exception as exc:
-                    self._early_recv_pending.pop(key, None)
-                    self._early_recv_current_key = None
-                    failure = exc
-                else:
-                    self._early_recv_pending.pop(key)
-                    self._early_recv_futures[key] = future
-                    self._early_recv_current_key = None
-                    inflight = len(self._early_recv_futures)
-                    queued = len(self._early_recv_pending)
-            if failure is not None:
+            try:
+                future = self._lwd_submit_early_recv(fields)
+            except LwdHostStageSlotBusy:
+                with self._early_recv_lock:
+                    self._early_recv_reserved.discard(key)
+                    if fields.connection not in self._early_recv_failed_connections:
+                        self._early_recv_pending[key] = hint
+                    if self._early_recv_current_key == key:
+                        self._early_recv_current_key = None
+                blocked.add(fields.connection)
+                continue
+            except Exception as exc:
+                with self._early_recv_lock:
+                    self._early_recv_reserved.discard(key)
+                    if self._early_recv_current_key == key:
+                        self._early_recv_current_key = None
                 if self._lwd_stager is not None:
                     self._lwd_stager.abandon((fields.connection, fields.seqno))
-                self._lwd_fail_early_recv_connection(fields.connection, fields.seqno, failure)
+                self._lwd_fail_early_recv_connection(fields.connection, fields.seqno, exc)
+                blocked.add(fields.connection)
+                continue
+
+            release_future = False
+            with self._early_recv_lock:
+                self._early_recv_reserved.discard(key)
+                if fields.connection in self._early_recv_failed_connections:
+                    release_future = True
+                else:
+                    self._early_recv_futures[key] = future
+                    inflight = len(self._early_recv_futures)
+                    queued = len(self._early_recv_pending)
+                if self._early_recv_current_key == key:
+                    self._early_recv_current_key = None
+            if release_future:
+                try:
+                    future.release_device_tensor()
+                except Exception:
+                    lwd_logger.exception(
+                        "[Lwd][pre-recv] failed to release receive tensor connection=%s", fields.connection
+                    )
                 blocked.add(fields.connection)
                 continue
             lwd_logger.info(
