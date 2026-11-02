@@ -87,9 +87,22 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         if not self._lwd_connections:
             self._lwd_connections = (ConnectionId(0, lwd_config.instance.id, self._lwd_dp_idx),)
-        endpoint_rank = lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
+        from vllm.distributed.lwd import LwdParallelGroupsSpec
+
         global_rank = dist.get_rank()
-        self._lwd_early_recv_endpoint = global_rank == endpoint_rank
+        spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
+        local = set(self._lwd_connections)
+        self._lwd_up_src_ranks = {
+            endpoints.connection_id: endpoints.cloud_rank
+            for endpoints in spec.channel_endpoints
+            if endpoints.connection_id in local
+        }
+        if set(self._lwd_up_src_ranks) != local:
+            raise RuntimeError("[Lwd][cloud-worker] missing channel endpoint for a local connection")
+        self._lwd_early_recv_connections = tuple(
+            connection for connection in self._lwd_connections if self._lwd_up_src_ranks[connection] == global_rank
+        )
+        self._lwd_early_recv_endpoint = bool(self._lwd_early_recv_connections)
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
         self._lwd_up_num_experts_per_tok = getattr(self.model_config.hf_config, "num_experts_per_tok", 0)
@@ -190,6 +203,10 @@ class LwdCloudWorker(LwdWorkerBase):
         meta = batch.batch_meta
         if meta is None or self._lwd_stager is None:
             return
+        from vllm_ascend.distributed.lwd_data_plane.lwd_types import connection_from
+
+        if connection_from(meta) not in self._lwd_early_recv_connections:
+            return
         for req_id in meta.aborted_req_ids or ():
             self._lwd_stager.abort_request(req_id)
 
@@ -255,7 +272,7 @@ class LwdCloudWorker(LwdWorkerBase):
             create_report_mq,
         )
 
-        connections = getattr(self, "_lwd_connections", (ConnectionId(0, 0, 0),))
+        connections = getattr(self, "_lwd_early_recv_connections", ())
         for connection in connections:
             self._irecv_hint_mqs[connection] = attach_hint_mq(connection)
             self._irecv_done_mqs[connection] = create_report_mq(connection)
@@ -324,6 +341,8 @@ class LwdCloudWorker(LwdWorkerBase):
                 key = self._early_recv_current_key
                 connection = key[0] if key is not None else ConnectionId(0, 0, 0)
                 self._lwd_fail_early_recv_connection(connection, self._early_recv_error_seqno(connection), exc)
+            if hint_mqs and all(connection in self._early_recv_failed_connections for connection in hint_mqs):
+                return
             # The ring's read side sched_yield-spins within the
             # just-read window (busy_loop_s=1s), so a 0.5ms timeout alone
             # does not cap the CPU — this sleep does; the cost is ~2ms of
@@ -527,8 +546,6 @@ class LwdCloudWorker(LwdWorkerBase):
             if connection in blocked or connection in self._early_recv_failed_connections:
                 continue
             done_mq = self._irecv_done_mqs.get(connection, self._irecv_done_mq)
-            if done_mq is None:
-                continue
             self._early_recv_current_key = key
             try:
                 if not future.done():
@@ -544,9 +561,15 @@ class LwdCloudWorker(LwdWorkerBase):
                 stager.release_if_drained(stage_key)
                 arrived = [(req_id, offset + rows) for req_id, rows, offset in published]
                 future.release_device_tensor()
-                for req_id, prefix_nonce in stager.take_refill_done():
-                    done_mq.enqueue(("refill_done", req_id, prefix_nonce))
-                done_mq.enqueue((key, arrived))
+                if done_mq is not None:
+                    for req_id, nonce in stager.take_refill_done():
+                        done_mq.enqueue(("refill_done", req_id, nonce))
+                    done_mq.enqueue((key, arrived))
+                else:
+                    # Consume-point fallback has no report reader. Completion
+                    # is still the future's lifecycle end: release its slot
+                    # and device buffer instead of wedging the inflight cap.
+                    stager.take_refill_done()
             except Exception as exc:
                 self._lwd_fail_early_recv_connection(connection, seqno, exc)
                 blocked.add(connection)

@@ -97,26 +97,37 @@ def lwd_init_channels() -> None:
     lwd_warm_up_channels()
 
 
-def _lwd_wait_with_timeout(work: dist.Work, timeout_s: float, description: str) -> None:
+def _lwd_echo_handshake(endpoints: LwdChannelEndpoints, connection: ConnectionId, timeout_s: float) -> None:
+    """Bound the whole echo, including HCCL posting and D2H synchronization.
+
+    A timed-out HCCL operation cannot be cancelled safely. Startup must fail
+    and the process must be restarted rather than reusing this channel.
+    """
     done = threading.Event()
     errors: list[BaseException] = []
+    phase = ["posting"]
 
-    def wait_for_work() -> None:
+    def run_echo() -> None:
         try:
-            work.wait()
+            _lwd_echo_handshake_impl(endpoints, connection, phase)
         except BaseException as exc:
             errors.append(exc)
         finally:
             done.set()
 
-    threading.Thread(target=wait_for_work, name="lwd-handshake-wait", daemon=True).start()
-    if not done.wait(timeout_s):
-        raise TimeoutError(f"[LWD] channel handshake timed out after {timeout_s}s: {description}")
+    threading.Thread(target=run_echo, name=f"lwd-echo-{connection}", daemon=True).start()
+    if not done.wait(timeout_s * 2):
+        raise TimeoutError(
+            f"[LWD] channel handshake timed out after {timeout_s * 2}s: "
+            f"{connection}, rank {dist.get_rank()}, phase {phase[0]}; restart required"
+        )
     if errors:
-        raise RuntimeError(f"[LWD] channel handshake failed: {description}: {errors[0]!r}") from errors[0]
+        raise RuntimeError(f"[LWD] channel handshake failed on {connection}: {errors[0]!r}") from errors[0]
 
 
-def _lwd_echo_handshake(endpoints: LwdChannelEndpoints, connection: ConnectionId, timeout_s: float) -> None:
+def _lwd_echo_handshake_impl(
+    endpoints: LwdChannelEndpoints, connection: ConnectionId, phase: list[str]
+) -> None:
     my_rank = dist.get_rank()
     up_group, up_peer = _LWD_CHANNEL_GROUPS[(connection, LwdChannelType.UP)]
     down_group, down_peer = _LWD_CHANNEL_GROUPS[(connection, LwdChannelType.DOWN)]
@@ -132,17 +143,23 @@ def _lwd_echo_handshake(endpoints: LwdChannelEndpoints, connection: ConnectionId
         recv = torch.zeros(_LWD_WARMUP_NUM_ELEMENTS, dtype=torch.int32, device="npu")
         send_work = dist.isend(send, dst=up_peer, group=up_group)
         recv_work = dist.irecv(recv, src=down_peer, group=down_group)
-        _lwd_wait_with_timeout(recv_work, timeout_s, f"DOWN echo on {connection}")
-        _lwd_wait_with_timeout(send_work, timeout_s, f"UP send on {connection}")
+        phase[0] = "UP send wait"
+        send_work.wait()
+        phase[0] = "DOWN receive wait"
+        recv_work.wait()
     else:
         recv = torch.zeros(_LWD_WARMUP_NUM_ELEMENTS, dtype=torch.int32, device="npu")
         recv_work = dist.irecv(recv, src=up_peer, group=up_group)
-        _lwd_wait_with_timeout(recv_work, timeout_s * 2, f"UP receive on {connection}")
+        phase[0] = "UP receive wait"
+        recv_work.wait()
+        phase[0] = "UP receive D2H"
         received = [int(value) for value in recv.cpu().tolist()]
         if received != expected:
             raise RuntimeError(f"[LWD] channel identity/version mismatch on {connection}: expected {expected}, got {received}")
         send_work = dist.isend(recv, dst=down_peer, group=down_group)
-        _lwd_wait_with_timeout(send_work, timeout_s * 2, f"DOWN echo send on {connection}")
+        phase[0] = "DOWN echo send wait"
+        send_work.wait()
+    phase[0] = "echo verification D2H"
     if not torch.equal(recv.cpu(), torch.tensor(expected, dtype=torch.int32)):
         raise RuntimeError(f"[LWD] channel echo mismatch on {connection}: expected {expected}, got {recv.cpu().tolist()}")
 

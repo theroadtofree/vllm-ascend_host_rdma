@@ -64,7 +64,7 @@ class LwdReqEmbed:
     numel: int
     prompt_rows: int
     hidden_size: int
-    host_base: int = 0
+    prefix_nonce: int = 0
     tail_off: int = -1
     tail_numel: int = 0
     num_hash_layers: int = 0
@@ -193,9 +193,20 @@ class LwdReqEmbed:
 
     def rewind_consumed(self, to_rows: int) -> None:
         """Move the read pointer back without changing arrival watermarks."""
-        if to_rows < self.host_base or to_rows > self.consumed:
+        if to_rows < 0 or to_rows > self.consumed:
+            raise LwdHostStageGeometryError(f"req={self.req_id}: rewind target {to_rows} outside [0, {self.consumed}]")
+        self.consumed = to_rows
+
+    def skip_consumed(self, to_rows: int) -> None:
+        """Skip rows covered by a re-admission prefix-cache hit."""
+        if to_rows < self.consumed or to_rows > self.recv_rows:
             raise LwdHostStageGeometryError(
-                f"req={self.req_id}: rewind target {to_rows} outside [{self.host_base}, {self.consumed}]"
+                f"req={self.req_id}: skip target {to_rows} outside "
+                f"[consumed={self.consumed}, recv_rows={self.recv_rows}]"
+            )
+        if to_rows > self.prompt_rows:
+            raise LwdHostStageGeometryError(
+                f"req={self.req_id}: skip target {to_rows} exceeds prompt_rows={self.prompt_rows}"
             )
         self.consumed = to_rows
 
@@ -273,6 +284,7 @@ class LwdHostStager:
         self._last_delivered: LwdStageKey = -1
         self._batch_reqs: dict[LwdStageKey, list[str]] = {}
         self._arrival_plan: dict[LwdStageKey, list[tuple[LwdReqEmbed, int, int]]] = {}
+        self._refill_done: list[tuple[str, int]] = []
         self._host_bytes = 0
         self._released_requests = 0
         self._aborted_requests = 0
@@ -328,6 +340,17 @@ class LwdHostStager:
             req = self._reqs.get(req_id)
             return req.consumed if req is not None else 0
 
+    def stage_floor(self, req_id: str) -> int:
+        with self._lock:
+            req = self._reqs.get(req_id)
+            return req._stage_floor if req is not None else 0
+
+    def take_refill_done(self) -> list[tuple[str, int]]:
+        with self._lock:
+            done = self._refill_done
+            self._refill_done = []
+        return done
+
     def allocate(self, seqno: LwdStageKey, numel: int) -> tuple[LwdBuffer, int]:
         """Bind a free device slot to one receive sequence number."""
         with self._lock:
@@ -362,6 +385,8 @@ class LwdHostStager:
             self._complete_end_plan(seqno, delivered=False)
             if batch is None:
                 return
+            abandoned_reqs = set(batch.req_ids)
+            self._refill_done = [item for item in self._refill_done if item[0] not in abandoned_reqs]
             for req_id in batch.created_req_ids:
                 req = self._reqs.get(req_id)
                 if req is not None and batch.request_hosts.get(req_id) is req and req._written_hi == req._stage_floor:
@@ -550,6 +575,7 @@ class LwdHostStager:
         """Freeze a request and guard its old plans until they drain."""
         with self._lock:
             req = self._reqs.get(req_id)
+            self._refill_done = [item for item in self._refill_done if item[0] != req_id]
             self._retire_request(req_id, wait_for_plan=req is None)
             if req is None:
                 return False
@@ -564,6 +590,7 @@ class LwdHostStager:
         with self._lock:
             req = self._reqs.pop(req_id, None)
             self._req_connections.pop(req_id, None)
+            self._refill_done = [item for item in self._refill_done if item[0] != req_id]
             if req is not None or req_id in self._ended_req_ids:
                 self._retire_request(req_id, wait_for_plan=False)
             if req is None:
@@ -609,7 +636,14 @@ class LwdHostStager:
         for pending in self._end_pending.values():
             pending.discard(seqno)
         for req_id in list(self._ended_req_ids):
-            if req_id in self._end_waiting or self._end_pending.get(req_id):
+            if req_id in self._end_waiting:
+                # An abort that raced ahead of the first hint stays guarded
+                # only until that request's first plan completes/abandons.
+                # Unrelated batches must not release the tombstone.
+                if req_id not in self._batch_reqs.get(seqno, ()):
+                    continue
+                self._end_waiting.discard(req_id)
+            if self._end_pending.get(req_id):
                 continue
             if delivered and _stage_sort_key(self._last_delivered) < _stage_sort_key(self._end_after[req_id]):
                 continue
@@ -662,9 +696,11 @@ class LwdHostStager:
     ) -> LwdReqEmbed:
         host = self._reqs.get(req_id)
         if host is None:
-            if offset > prompt_rows or offset + n_rows > prompt_rows:
+            if refill:
+                raise LwdHostStageGeometryError(f"req={req_id}: refill chunk for an unknown request")
+            if offset + n_rows > prompt_rows:
                 raise LwdHostStageGeometryError(
-                    f"req={req_id}: first chunk rows [{offset}, {offset + n_rows}) exceed prompt_rows={prompt_rows}"
+                    f"req={req_id}: chunk end {offset + n_rows} exceeds prompt_rows={prompt_rows}"
                 )
             host = LwdReqEmbed(
                 req_id=req_id,
@@ -672,17 +708,11 @@ class LwdHostStager:
                 numel=prompt_rows * hidden_size,
                 prompt_rows=prompt_rows,
                 hidden_size=hidden_size,
-                host_base=offset,
+                prefix_nonce=prefix_nonce,
                 tail_off=prompt_rows * hidden_size if tail_per_row else -1,
                 tail_numel=prompt_rows * tail_per_row,
                 num_hash_layers=num_hash_layers,
                 num_experts_per_tok=num_experts_per_tok,
-                # Prefix-cache hits never arrive over UP. Start both watermarks
-                # after that sparse prefix; its uninitialized host rows are
-                # therefore never readable.
-                recv_rows=offset,
-                consumed=offset,
-                _written_hi=offset,
             )
             self._reqs[req_id] = host
             self._host_bytes += (host.numel + host.tail_numel) * 2

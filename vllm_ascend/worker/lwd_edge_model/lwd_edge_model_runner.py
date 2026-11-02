@@ -281,6 +281,11 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # wait_on_current_stream: device-ordered wait; the host never blocks
         recv_future.wait_on_current_stream()
         result = recv_future.result()
+        # The receive tensor was allocated on the channel stream but is
+        # consumed by lm_head on the compute stream. Keep its allocation
+        # alive until that stream's work completes, including after the
+        # future and its local result leave scope.
+        result.tensor.record_stream(torch.npu.current_stream())
         _t_tensor = time.monotonic()
         hidden_size = self.model_config.get_hidden_size()
         hidden_states = result.tensor.view(-1, hidden_size)  # (rows_total, H)

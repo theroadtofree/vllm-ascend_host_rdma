@@ -63,6 +63,8 @@ def make_recv_hint(
     rows: list[int],
     prompt_offsets: list[int],
     prompt_lens: list[int],
+    refills: list[bool] | None = None,
+    prefix_nonces: list[int] | None = None,
     connection_id: ConnectionId | None = None,
     edge_id: int = 0,
     cloud_id: int = 0,

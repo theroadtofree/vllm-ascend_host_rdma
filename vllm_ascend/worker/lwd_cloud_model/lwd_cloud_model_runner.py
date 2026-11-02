@@ -106,8 +106,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     ) -> None:
         super().__init__(vllm_config, device, worker)
         self._lwd_pending_down_payload = None
-        self._lwd_resume_base: dict[str, int] = {}
-        self._lwd_step_tail_base: dict[str, int] = {}
         self._lwd_request_connections: dict[str, ConnectionId] = {}
         self._lwd_token_rank_encoder = LwdTokenRankEncoder()
         # Row-slot residue cleanup: flush reused rows as soon as a request
@@ -395,10 +393,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             return
         cached = scheduler_output.scheduled_cached_reqs
         for req_id, new_computed in zip(cached.req_ids, cached.num_computed_tokens):
+            # Each connection is staged only on its real endpoint rank. Other
+            # TP ranks must not rewind a nonexistent local host descriptor.
+            if stager.take_req(req_id) is None:
+                continue
             consumed = stager.consumed_rows(req_id)
             if consumed > new_computed:
                 stager.rewind_consumed(req_id, new_computed)
-                self._lwd_resume_base.pop(req_id, None)
                 lwd_logger.info(
                     "[LWD][cloud-runner] REWIND req=%s: host read pointer "
                     "%d -> %d (preemption recompute; payload retained)",
@@ -652,8 +653,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         embeds_map = self.input_batch.req_prompt_embeds
         req_id_to_index = self.input_batch.req_id_to_index
         for req_id in finished_req_ids:
-            self._lwd_resume_base.pop(req_id, None)
-            self._lwd_step_tail_base.pop(req_id, None)
             self._lwd_request_connections.pop(req_id, None)
             if self.lwd_hash_state is not None:
                 self.lwd_hash_state.discard(req_id)
@@ -702,7 +701,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         for connection in sorted(grouped):
             connection_plan = grouped[connection]
             numel = sum(window.rows for window in connection_plan) * (hidden_size + tail_per_row)
-            if worker._lwd_early_recv_endpoint:
+            connection_endpoint = worker._lwd_up_src_ranks[connection] == dist.get_rank()
+            if connection_endpoint:
                 stager = worker._lwd_stager
                 if stager is None:
                     raise RuntimeError("[Lwd][cloud-runner] endpoint rank without host stager")
@@ -714,7 +714,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             if tp.world_size > 1:
                 work = dist.broadcast(
                     dev,
-                    src=tp.ranks[0],
+                    src=worker._lwd_up_src_ranks[connection],
                     group=tp.device_group,
                     async_op=True,
                 )
@@ -763,10 +763,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 if tail_per_row:
                     req = stager.take_req(window.req_id)
                     assert req is not None
-                    tail_start, _ = req.tail_range_at(
-                        self._lwd_step_tail_base[window.req_id],
-                        window.rows,
-                    )
+                    tail_start, _ = req.tail_range_at(window.start, window.rows)
                     numel = window.rows * tail_per_row
                     dev[tail_offset : tail_offset + numel].copy_(
                         req.host[tail_start : tail_start + numel],
@@ -830,23 +827,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         computed = self.input_batch.num_computed_tokens_cpu
         expect = int(computed[window.req_index])
         consumed = stager.consumed_rows(window.req_id)
-        resume_base = getattr(self, "_lwd_resume_base", None)
-        if resume_base is None:
-            resume_base = self._lwd_resume_base = {}
-        base = resume_base.get(window.req_id)
-        if base is None:
-            base = max(expect - consumed, 0)
-            resume_base[window.req_id] = base
-        if consumed != expect - base:
+        if consumed != expect or consumed != window.start:
             raise RuntimeError(
                 f"[Lwd][cloud-runner] STAGE POSITION MISMATCH req={window.req_id}: "
                 f"host read pointer consumed={consumed}, computed={expect}, "
-                f"resume_base={base}, window_start={window.start}"
+                f"window_start={window.start}"
             )
-        tail_base = getattr(self, "_lwd_step_tail_base", None)
-        if tail_base is None:
-            tail_base = self._lwd_step_tail_base = {}
-        tail_base[window.req_id] = consumed
         host_start, numel, _ = stager.segment_for(window.req_id, window.rows)
         if numel != window.rows * hidden_size:
             raise RuntimeError(f"[Lwd][cloud-runner] invalid host window for {window.req_id}")
@@ -957,14 +943,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: GrammarOutput | None) -> ModelRunnerOutput:
-        from vllm.distributed.parallel_state import get_tp_group
-
-        # Only the cloud TP-group first rank (= the DOWN channel endpoint
-        # rank) collects/sends; the other ranks have no channel peer, so
-        # their collect-and-discard is skipped too (8-card redundancy).
-        wire_endpoint = get_tp_group().is_first_rank
+        # Every TP rank collects its sampler/hidden state. Each connection's
+        # payload is retained only on that connection's real channel endpoint.
         captured = None
-        if wire_endpoint and self.execute_model_state is not None:
+        if self.execute_model_state is not None:
             # ExecuteModelState layout (see model_runner_v1.sample_tokens):
             # (scheduler_output, logits, spec_decode_metadata,
             #  spec_decode_common_attn_metadata, hidden_states,
@@ -986,7 +968,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self._lwd_captured_sampler_output = None
         output = super().sample_tokens(grammar_output)
         if captured is not None and self._lwd_captured_sampler_output is not None:
-            self._lwd_pending_down_payload = self._lwd_collect_down_payload(
+            payload = self._lwd_collect_down_payload(
                 captured[0],
                 captured[1],
                 captured[2],
@@ -995,6 +977,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 captured[5],
                 self._lwd_captured_sampler_output,
             )
+            if self.worker is not None:
+                local_connections = set(self.worker._lwd_early_recv_connections)
+                self._lwd_pending_down_payload = [
+                    item for item in payload if item.connection in local_connections
+                ]
         return output
 
     def take_lwd_pending_down_payload(self) -> list[LwdDownPayload] | None:

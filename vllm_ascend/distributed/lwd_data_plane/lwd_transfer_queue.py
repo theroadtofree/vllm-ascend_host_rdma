@@ -198,13 +198,15 @@ class LwdTransferQueue:
             return future
         future = self._execute_next(request)
         self._next_seqno += 1
-        # TODO(lwd): confirm whether this drain should also step over skipped
-        # seqnos, as _advance_past_skipped does: a held seqno right after a
-        # skipped one is only posted on the next submit or skip_seqno call.
+        # Drain both held requests and skipped holes. Otherwise a held seqno
+        # immediately after an abort hole remains deferred until unrelated
+        # future traffic arrives.
+        self._advance_past_skipped()
         while self._next_seqno in self._held:
             held_request, held_future = self._held.pop(self._next_seqno)
             self._execute_next(held_request, into=held_future)
             self._next_seqno += 1
+            self._advance_past_skipped()
         return future
 
     def _execute_next(
