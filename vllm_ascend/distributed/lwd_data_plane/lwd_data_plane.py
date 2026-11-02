@@ -45,6 +45,7 @@ class LwdDataPlane:
         self._pending_skips: dict[tuple[ConnectionId, LwdChannelType, str], set[int]] = {}
         self._lock = threading.Lock()
         self._shutting_down = False
+        self._closed = False
         self._failed_connections: set[ConnectionId] = set()
 
     # ------------------------------------------------------------------ #
@@ -126,6 +127,7 @@ class LwdDataPlane:
             if self._shutting_down:
                 return
             self._shutting_down = True
+            self._closed = True
             queues = list(self._queues.values())
         try:
             for queue in queues:
@@ -144,8 +146,8 @@ class LwdDataPlane:
 
     def _submit(self, request: LwdTransferRequest) -> LwdTransferFuture:
         with self._lock:
-            if self._shutting_down:
-                raise RuntimeError("lwd-comm service is shutting down")
+            if self._shutting_down or self._closed:
+                raise RuntimeError("lwd-comm service is shut down")
             if request.connection in self._failed_connections:
                 raise RuntimeError(f"lwd-comm connection {request.connection} has failed")
             key = (request.connection, request.channel, request.op)

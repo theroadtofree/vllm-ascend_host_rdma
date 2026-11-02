@@ -761,11 +761,19 @@ class LwdCloudWorker(LwdWorkerBase):
                 lwd_logger.warning("[Lwd][pre-recv] comm thread did not stop within %.1fs", _LWD_SHUTDOWN_TIMEOUT_S)
         try:
             lwd_get_data_plane().shutdown(timeout=_LWD_SHUTDOWN_TIMEOUT_S)
-            from vllm_ascend.distributed.lwd_data_plane.lwd_channels import (
-                lwd_destroy_channels,
-            )
+            if thread is not None and thread.is_alive():
+                # A blocked HCCL call may outlive this worker. The data plane is
+                # permanently closed against new submissions, but its channels
+                # must remain valid until the process exits and reaps the thread.
+                lwd_logger.warning(
+                    "[Lwd][pre-recv] skip channel destruction while comm thread is alive"
+                )
+            else:
+                from vllm_ascend.distributed.lwd_data_plane.lwd_channels import (
+                    lwd_destroy_channels,
+                )
 
-            lwd_destroy_channels()
+                lwd_destroy_channels()
         finally:
             super().shutdown()
 
