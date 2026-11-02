@@ -63,11 +63,7 @@ def lwd_init_channels() -> None:
     backend = dist.get_backend(get_world_group().device_group)
     my_rank = dist.get_rank()
     for endpoints in spec.channel_endpoints:
-        connection = ConnectionId(
-            getattr(endpoints, "edge_id", 0),
-            getattr(endpoints, "cloud_id", 0),
-            endpoints.dp_idx,
-        )
+        connection = endpoints.connection_id
         ranks = [endpoints.edge_rank, endpoints.cloud_rank]
         for channel in LwdChannelType:
             # Both channels span the same rank pair; the direction is given
@@ -171,11 +167,7 @@ def lwd_warm_up_channels() -> None:
         raise ValueError("VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S must be positive")
     started = time.monotonic()
     for endpoints in _LWD_ENDPOINTS:
-        connection = ConnectionId(
-            getattr(endpoints, "edge_id", 0),
-            getattr(endpoints, "cloud_id", 0),
-            endpoints.dp_idx,
-        )
+        connection = endpoints.connection_id
         _lwd_echo_handshake(endpoints, connection, timeout_s)
         logger.info(
             "[LWD] data-plane echo validated connection=%s version=%d edge_rank=%d cloud_rank=%d",
