@@ -102,9 +102,12 @@ def _lwd_echo_handshake(endpoints: LwdChannelEndpoints, connection: ConnectionId
     done = threading.Event()
     errors: list[BaseException] = []
     phase = ["posting"]
+    device = torch.npu.current_device()
 
     def run_echo() -> None:
         try:
+            # NPU device selection is thread-local; do not fall back to card 0.
+            torch.npu.set_device(device)
             _lwd_echo_handshake_impl(endpoints, connection, phase)
         except BaseException as exc:
             errors.append(exc)
