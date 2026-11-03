@@ -654,10 +654,9 @@ class LwdCloudWorker(LwdWorkerBase):
         output = self.model_runner.sample_tokens(grammar_output)
         _t_sample = time.monotonic()
         # rank-replay DOWN: send the hidden packet (channel-async,
-        # in-stream ordered); the step meta stays on device until the
-        # fenced harvest below brings it to the host with a device-side
-        # stream dependency (dedicated stream wait_event on the ready
-        # event, completion event recorded on the copy stream itself).
+        # in-stream ordered). The executor output thread harvests each
+        # connection's device meta behind its per-step ready event, keeping
+        # this worker thread free to prepare and execute subsequent steps.
         payloads = self.model_runner.take_lwd_pending_down_payload()
         if payloads:
             from vllm.distributed.parallel_state import get_tp_group
@@ -665,6 +664,8 @@ class LwdCloudWorker(LwdWorkerBase):
             is_driver = get_tp_group().is_first_rank
             carriers = []
             legacy_carrier = None
+            ready_events = {}
+            legacy_ready_event = None
             for payload in payloads:
                 connection = payload.connection
                 hidden = payload.hidden
@@ -696,30 +697,20 @@ class LwdCloudWorker(LwdWorkerBase):
                     # Every rank advances the same seqno, but only TP0 returns
                     # C2E metadata through the executor's single output rank.
                     continue
-                # Preserve the fenced metadata harvest independently per connection.
-                _t_harvest = time.monotonic()
-                stream = self._lwd_get_harvest_stream()
-                n_dev = meta_dev.numel()
-                n_seg = len(seg_lens_host) if seg_lens_host is not None else 0
-                buf = self._lwd_get_harvest_pinned(max(n_dev + n_seg, 4096), connection)
-                with torch.npu.stream(stream):
-                    stream.wait_event(ready_event)
-                    buf[:n_dev].copy_(meta_dev, non_blocking=True)
-                    done = torch.npu.Event()
-                    done.record()
-                done.synchronize()
-                if n_seg:
-                    buf.numpy()[n_dev : n_dev + n_seg] = seg_lens_host
-                carrier = (buf[: n_dev + n_seg], req_ids, hidden.numel(), seqno, connection)
+                # The device meta and its ready event travel with the output;
+                # the executor output thread owns the fenced D2H harvest.
+                carrier = (meta_dev, seg_lens_host, req_ids, hidden.numel(), seqno, connection)
                 carriers.append(carrier)
+                ready_events[connection] = ready_event
                 if legacy_carrier is None:
-                    legacy_carrier = carrier[:4]
+                    legacy_carrier = carrier[:5]
+                    legacy_ready_event = ready_event
                 lwd_logger.info(
-                    "[Lwd][perf] cloud-step connection=%s seqno=%d sample=%.2f harvest=%.2f total=%.2fms rows=%d",
+                    "[Lwd][perf] cloud-step connection=%s seqno=%d sample=%.2f send=%.2f total=%.2fms rows=%d",
                     connection,
                     seqno,
                     (_t_sample - _t0) * 1000,
-                    (time.monotonic() - _t_harvest) * 1000,
+                    (time.monotonic() - _t_sample) * 1000,
                     (time.monotonic() - _t0) * 1000,
                     hidden.shape[0],
                 )
@@ -727,33 +718,11 @@ class LwdCloudWorker(LwdWorkerBase):
                 target = getattr(output, "_model_runner_output", output)
                 target.lwd_down_carriers = carriers
                 target.lwd_down_carrier = legacy_carrier
+                # The events belong to this output generation and must be
+                # consumed before the output crosses the process boundary.
+                target.lwd_meta_ready_events = ready_events
+                target.lwd_meta_ready_event = legacy_ready_event
         return output
-
-    def _lwd_get_harvest_stream(self) -> torch.npu.Stream:
-        """Lazily create the dedicated harvest stream (one per worker)."""
-        if not hasattr(self, "_lwd_harvest_stream"):
-            self._lwd_harvest_stream = torch.npu.Stream()
-        return self._lwd_harvest_stream
-
-    def _lwd_get_harvest_pinned(
-        self,
-        min_capacity: int,
-        connection: ConnectionId | None = None,
-    ) -> torch.Tensor:
-        """Lazily allocate or grow one pinned harvest buffer per connection."""
-        connection = connection or ConnectionId(0, 0, 0)
-        buffers = getattr(self, "_lwd_harvest_pinned_by_connection", None)
-        if buffers is None:
-            buffers = self._lwd_harvest_pinned_by_connection = {}
-        buf = buffers.get(connection)
-        if buf is None or buf.numel() < min_capacity:
-            buf = buffers[connection] = torch.empty(
-                min_capacity,
-                dtype=torch.int32,
-                pin_memory=True,
-            )
-        self._lwd_harvest_pinned = buf
-        return buf
 
     # ------------------------------------------------------------------ #
     # LWD housekeeping (control-plane glue)                               #
