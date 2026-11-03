@@ -21,9 +21,10 @@ import torch
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.lwd_logger import lwd_logger
+from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, connection_from
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
@@ -676,18 +677,23 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         if request_connections is None:
             request_connections = self._lwd_request_connections = {}
         connections = getattr(worker, "_lwd_connections", ())
-        default = connections[0] if len(connections) == 1 else ConnectionId(0, 0, 0)
-        if scheduler_output is not None:
-            batch = getattr(scheduler_output, "lwd_batch", None)
-            meta = getattr(batch, "batch_meta", None)
-            if meta is not None:
-                current = connection_from(meta)
-                for req_id in getattr(meta, "req_ids", ()):
-                    request_connections[req_id] = current
-                default = current
+
+        def request_connection(req_id: str) -> ConnectionId:
+            # Canonical cloud request IDs carry their source edge. A native
+            # mixed batch can contain several edges, so defaulting to edge 0
+            # would select the wrong UP/DOWN FIFO for the other requests.
+            edge_id, _ = parse_edge_id(req_id)
+            candidates = [c for c in connections if c.edge_id == edge_id]
+            if len(candidates) != 1:
+                raise RuntimeError(
+                    f"[Lwd][cloud-runner] req={req_id} has no unique local connection"
+                )
+            return candidates[0]
+
         grouped: dict[ConnectionId, list[LwdPromptWindow]] = {}
         for window in plan:
-            connection = request_connections.setdefault(window.req_id, default)
+            connection = request_connection(window.req_id)
+            request_connections[window.req_id] = connection
             grouped.setdefault(connection, []).append(window)
 
         hidden_size = self.model_config.get_hidden_size()
