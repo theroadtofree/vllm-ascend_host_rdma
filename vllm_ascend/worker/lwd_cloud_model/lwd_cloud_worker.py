@@ -660,6 +660,9 @@ class LwdCloudWorker(LwdWorkerBase):
         # event, completion event recorded on the copy stream itself).
         payloads = self.model_runner.take_lwd_pending_down_payload()
         if payloads:
+            from vllm.distributed.parallel_state import get_tp_group
+
+            is_driver = get_tp_group().is_first_rank
             carriers = []
             legacy_carrier = None
             for payload in payloads:
@@ -670,24 +673,29 @@ class LwdCloudWorker(LwdWorkerBase):
                 ready_event = payload.ready_event
                 req_ids = payload.req_ids
                 seqno = self._lwd_next_down_seqno(connection)
-                lwd_logger.info(
-                    "[Lwd][cloud-worker] DOWN send connection=%s seqno=%d numel=%d",
-                    connection,
-                    seqno,
-                    hidden.numel(),
-                )
-                lwd_get_data_plane().submit_send(
-                    LwdTransferRequest(
-                        channel=LwdChannelType.DOWN,
-                        op="send",
-                        num_elements=hidden.numel(),
-                        dp_idx=connection.dp_idx,
-                        edge_id=connection.edge_id,
-                        cloud_id=connection.cloud_id,
-                        tensor=hidden,
-                        seqno=seqno,
+                if connection in self._lwd_early_recv_connections:
+                    lwd_logger.info(
+                        "[Lwd][cloud-worker] DOWN send connection=%s seqno=%d numel=%d",
+                        connection,
+                        seqno,
+                        hidden.numel(),
                     )
-                )
+                    lwd_get_data_plane().submit_send(
+                        LwdTransferRequest(
+                            channel=LwdChannelType.DOWN,
+                            op="send",
+                            num_elements=hidden.numel(),
+                            dp_idx=connection.dp_idx,
+                            edge_id=connection.edge_id,
+                            cloud_id=connection.cloud_id,
+                            tensor=hidden,
+                            seqno=seqno,
+                        )
+                    )
+                if not is_driver:
+                    # Every rank advances the same seqno, but only TP0 returns
+                    # C2E metadata through the executor's single output rank.
+                    continue
                 # Preserve the fenced metadata harvest independently per connection.
                 _t_harvest = time.monotonic()
                 stream = self._lwd_get_harvest_stream()
@@ -715,7 +723,7 @@ class LwdCloudWorker(LwdWorkerBase):
                     (time.monotonic() - _t0) * 1000,
                     hidden.shape[0],
                 )
-            if output is not None:
+            if is_driver and output is not None:
                 target = getattr(output, "_model_runner_output", output)
                 target.lwd_down_carriers = carriers
                 target.lwd_down_carrier = legacy_carrier

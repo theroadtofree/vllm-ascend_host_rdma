@@ -983,11 +983,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 captured[5],
                 self._lwd_captured_sampler_output,
             )
-            if self.worker is not None:
-                local_connections = set(self.worker._lwd_early_recv_connections)
-                self._lwd_pending_down_payload = [
-                    item for item in payload if item.connection in local_connections
-                ]
+            # Keep every connection on every rank: TP0 returns all C2E
+            # metadata to the engine, while each real channel endpoint sends
+            # only its own DOWN tensor in the worker.
+            self._lwd_pending_down_payload = payload
         return output
 
     def take_lwd_pending_down_payload(self) -> list[LwdDownPayload] | None:
