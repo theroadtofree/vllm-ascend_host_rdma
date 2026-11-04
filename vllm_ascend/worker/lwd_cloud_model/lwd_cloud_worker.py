@@ -621,14 +621,14 @@ class LwdCloudWorker(LwdWorkerBase):
                 arrived = [(req_id, offset + rows) for req_id, rows, offset in published]
                 future.release_device_tensor()
                 if done_mq is not None:
-                    for req_id, nonce in stager.take_refill_done():
+                    for req_id, nonce in stager.take_refill_done(connection):
                         done_mq.enqueue(("refill_done", req_id, nonce))
                     done_mq.enqueue((key, arrived))
                 else:
                     # Consume-point fallback has no report reader. Completion
                     # is still the future's lifecycle end: release its slot
                     # and device buffer instead of wedging the inflight cap.
-                    stager.take_refill_done()
+                    stager.take_refill_done(connection)
             except Exception as exc:
                 self._lwd_fail_early_recv_connection(connection, seqno, exc)
                 blocked.add(connection)

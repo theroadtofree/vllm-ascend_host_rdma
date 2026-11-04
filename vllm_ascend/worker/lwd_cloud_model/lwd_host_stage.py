@@ -284,7 +284,10 @@ class LwdHostStager:
         self._last_delivered: LwdStageKey = -1
         self._batch_reqs: dict[LwdStageKey, list[str]] = {}
         self._arrival_plan: dict[LwdStageKey, list[tuple[LwdReqEmbed, int, int]]] = {}
-        self._refill_done: list[tuple[str, int]] = []
+        # (connection, req_id, prefix_nonce); connection is None for
+        # single-connection (int) stage keys. Drained per connection so one
+        # edge never consumes another edge's refill completion.
+        self._refill_done: list[tuple[ConnectionId | None, str, int]] = []
         self._host_bytes = 0
         self._released_requests = 0
         self._aborted_requests = 0
@@ -345,10 +348,12 @@ class LwdHostStager:
             req = self._reqs.get(req_id)
             return req._stage_floor if req is not None else 0
 
-    def take_refill_done(self) -> list[tuple[str, int]]:
+    def take_refill_done(self, connection: ConnectionId | None = None) -> list[tuple[str, int]]:
+        """Drain refill completions of one connection, keeping the rest."""
         with self._lock:
-            done = self._refill_done
-            self._refill_done = []
+            done = [(req_id, nonce) for conn, req_id, nonce in self._refill_done if conn == connection]
+            if done:
+                self._refill_done = [item for item in self._refill_done if item[0] != connection]
         return done
 
     def allocate(self, seqno: LwdStageKey, numel: int) -> tuple[LwdBuffer, int]:
@@ -386,7 +391,7 @@ class LwdHostStager:
             if batch is None:
                 return
             abandoned_reqs = set(batch.req_ids)
-            self._refill_done = [item for item in self._refill_done if item[0] not in abandoned_reqs]
+            self._refill_done = [item for item in self._refill_done if item[1] not in abandoned_reqs]
             for req_id in batch.created_req_ids:
                 req = self._reqs.get(req_id)
                 if req is not None and batch.request_hosts.get(req_id) is req and req._written_hi == req._stage_floor:
@@ -510,6 +515,7 @@ class LwdHostStager:
 
     def publish_received(self, seqno: LwdStageKey) -> list[tuple[str, int, int]]:
         """Publish active D2H arrivals and release the receive slot."""
+        connection = seqno[0] if isinstance(seqno, tuple) else None
         with self._lock:
             plan = self._arrival_plan.pop(seqno, None)
             if plan is None:
@@ -525,7 +531,7 @@ class LwdHostStager:
                     host._refill_lo = None
                     host._refill_hi = None
                     host._refill_completed = False
-                    self._refill_done.append((host.req_id, host.prefix_nonce))
+                    self._refill_done.append((connection, host.req_id, host.prefix_nonce))
                 rows.append((host.req_id, n_rows, dest_row))
             slot = self._seqno_slot.pop(seqno, -1)
             if slot >= 0:
@@ -575,7 +581,7 @@ class LwdHostStager:
         """Freeze a request and guard its old plans until they drain."""
         with self._lock:
             req = self._reqs.get(req_id)
-            self._refill_done = [item for item in self._refill_done if item[0] != req_id]
+            self._refill_done = [item for item in self._refill_done if item[1] != req_id]
             self._retire_request(req_id, wait_for_plan=req is None)
             if req is None:
                 return False
@@ -590,7 +596,7 @@ class LwdHostStager:
         with self._lock:
             req = self._reqs.pop(req_id, None)
             self._req_connections.pop(req_id, None)
-            self._refill_done = [item for item in self._refill_done if item[0] != req_id]
+            self._refill_done = [item for item in self._refill_done if item[1] != req_id]
             if req is not None or req_id in self._ended_req_ids:
                 self._retire_request(req_id, wait_for_plan=False)
             if req is None:
