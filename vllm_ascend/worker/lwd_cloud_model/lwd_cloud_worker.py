@@ -607,6 +607,12 @@ class LwdCloudWorker(LwdWorkerBase):
             done_mq = self._irecv_done_mqs.get(connection, self._irecv_done_mq)
             self._early_recv_current_key = key
             try:
+                if done_mq is None:
+                    # No report reader for this connection: leave the future
+                    # queued (aligned with the memc baseline; no consume-point
+                    # fallback recycling).
+                    blocked.add(connection)
+                    continue
                 if not future.done():
                     blocked.add(connection)
                     continue
@@ -620,15 +626,9 @@ class LwdCloudWorker(LwdWorkerBase):
                 stager.release_if_drained(stage_key)
                 arrived = [(req_id, offset + rows) for req_id, rows, offset in published]
                 future.release_device_tensor()
-                if done_mq is not None:
-                    for req_id, nonce in stager.take_refill_done(connection):
-                        done_mq.enqueue(("refill_done", req_id, nonce))
-                    done_mq.enqueue((key, arrived))
-                else:
-                    # Consume-point fallback has no report reader. Completion
-                    # is still the future's lifecycle end: release its slot
-                    # and device buffer instead of wedging the inflight cap.
-                    stager.take_refill_done(connection)
+                for req_id, nonce in stager.take_refill_done(connection):
+                    done_mq.enqueue(("refill_done", req_id, nonce))
+                done_mq.enqueue((key, arrived))
             except Exception as exc:
                 self._lwd_fail_early_recv_connection(connection, seqno, exc)
                 blocked.add(connection)
