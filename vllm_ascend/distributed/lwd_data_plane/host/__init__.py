@@ -3,7 +3,7 @@
 
 The package's contract is 'host RoCE transport' — the vocabulary of the
 topology's ``data_plane_comm: host``. UCX is the current implementation
-detail: the transport core lives in the vllm repo (``vllm/v1/data_comm``,
+detail: the transport core lives in the vllm repo (``vllm/v1/lwd_comm/data_comm``,
 pure Python ctypes over libucp), and this package assembles it for NPU:
 
   * ``host_channels`` — identity-driven bootstrap + registry (the public

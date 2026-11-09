@@ -45,7 +45,7 @@ import torch
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
-from vllm.v1.data_comm.ucx_channel import UcxListener
+from vllm.v1.lwd_comm.data_comm.ucx_channel import UcxListener
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType

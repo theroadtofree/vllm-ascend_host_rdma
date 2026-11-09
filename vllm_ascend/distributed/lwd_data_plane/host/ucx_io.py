@@ -3,7 +3,7 @@
 
 Ported from the host_rdma branch's ``vllm_ascend/distributed/lwd_comm/
 ucx_npu_channel.py``: generic host-host transport (the vllm repo's
-``vllm.v1.data_comm`` UHC1 channel family) + NPU device orchestration
+``vllm.v1.lwd_comm.data_comm`` UHC1 channel family) + NPU device orchestration
 (D2H/H2D) + future/callback wiring, on top of the new-repo
 ``LwdTransferFuture``.
 
@@ -47,8 +47,8 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
-from vllm.v1.data_comm.ucx_channel import HostDoneEvent, UcxCfg
-from vllm.v1.data_comm.ucx_port import UcxTransportPort, open_transport
+from vllm.v1.lwd_comm.data_comm.ucx_channel import HostDoneEvent, UcxCfg
+from vllm.v1.lwd_comm.data_comm.ucx_port import UcxTransportPort, open_transport
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
