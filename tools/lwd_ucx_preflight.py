@@ -36,7 +36,7 @@ _POLICY_PATH = (
     / "vllm_ascend"
     / "distributed"
     / "lwd_data_plane"
-    / "ucx"
+    / "host"
     / "ucx_block_policy.py"
 )
 _policy_spec = importlib.util.spec_from_file_location(

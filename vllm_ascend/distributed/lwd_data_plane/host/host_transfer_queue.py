@@ -1,5 +1,5 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""LwdUcxTransferQueue: the UCX implementation of one (dp, channel, op)
+"""LwdHostTransferQueue: the host (UCX) implementation of one (dp, channel, op)
 FIFO.
 
 Subclasses the HCCL ``LwdTransferQueue`` and swaps only the execution
@@ -41,12 +41,12 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
     LwdChannelType,
     LwdTransferRequest,
 )
-from vllm_ascend.distributed.lwd_data_plane.ucx.ucx_channels import (
-    lwd_get_ucx_io,
+from vllm_ascend.distributed.lwd_data_plane.host.host_channels import (
+    lwd_get_host_io,
 )
 
 
-class LwdUcxTransferQueue(LwdTransferQueue):
+class LwdHostTransferQueue(LwdTransferQueue):
     """One FIFO of pending requests for one DP connection, channel and op,
     backed by a UCX host-RoCE link."""
 
@@ -77,7 +77,7 @@ class LwdUcxTransferQueue(LwdTransferQueue):
         io = getattr(self, "_ucx_io", None)
         if io is None:
             try:
-                io = lwd_get_ucx_io(self.channel_type, self.dp_idx, self.op)
+                io = lwd_get_host_io(self.channel_type, self.dp_idx, self.op)
             except RuntimeError:
                 # Not an endpoint rank of this connection (or channels not
                 # initialized): leave it unset; _execute would fail loudly.
@@ -98,7 +98,7 @@ class LwdUcxTransferQueue(LwdTransferQueue):
             future = into or LwdTransferFuture(req, [], None)
             future._finalize(
                 error=RuntimeError(
-                    f"no UCX {self.op} IO for channel "
+                    f"no host {self.op} IO for channel "
                     f"{self.channel_type.value} dp_idx={self.dp_idx}"
                 )
             )

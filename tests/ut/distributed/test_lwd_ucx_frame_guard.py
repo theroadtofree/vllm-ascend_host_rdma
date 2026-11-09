@@ -7,7 +7,7 @@ import queue
 
 import pytest
 
-from vllm_ascend.distributed.lwd_data_plane.ucx.ucx_io import NpuUcxChannelIo
+from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import NpuUcxChannelIo
 
 
 class _Tensor:

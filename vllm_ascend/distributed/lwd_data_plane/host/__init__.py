@@ -1,32 +1,40 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-"""UCX (host RoCE) backend of the LWD data plane.
+"""Host (RoCE) backend of the LWD data plane.
 
-Transport core lives in the vllm repo (``vllm/v1/data_comm``, pure
-Python ctypes over libucp); this package assembles it for NPU:
-``ucx_io`` (link IO + D2H/H2D orchestration), ``ucx_channels``
-(deterministic topology-derived bootstrap + registry) and
-``lwd_ucx_queue`` (the LwdTransferQueue implementation the data-plane
-factory selects when the topology sets ``data_plane_comm: host``).
+The package's contract is 'host RoCE transport' — the vocabulary of the
+topology's ``data_plane_comm: host``. UCX is the current implementation
+detail: the transport core lives in the vllm repo (``vllm/v1/data_comm``,
+pure Python ctypes over libucp), and this package assembles it for NPU:
+
+  * ``host_channels`` — identity-driven bootstrap + registry (the public
+    ``lwd_*_host_*`` entry points);
+  * ``host_transfer_queue`` — ``LwdHostTransferQueue``, the
+    ``LwdTransferQueue`` implementation the data-plane factory selects
+    for host comm;
+  * ``ucx_io`` / ``ucx_block_policy`` — UCX-specific internals (link IO
+    + D2H/H2D orchestration, block auto-sizing).
 """
 
-from vllm_ascend.distributed.lwd_data_plane.ucx.ucx_channels import (
+from vllm_ascend.distributed.lwd_data_plane.host.host_channels import (
     lwd_data_plane_comm,
     lwd_data_plane_is_host,
-    lwd_destroy_ucx_channels,
-    lwd_get_ucx_io,
-    lwd_init_ucx_channels,
-    lwd_ucx_channels_initialized,
+    lwd_destroy_host_channels,
+    lwd_get_host_io,
+    lwd_init_host_channels,
+    lwd_host_channels_initialized,
+    lwd_warm_up_host_channels,
 )
-from vllm_ascend.distributed.lwd_data_plane.ucx.lwd_ucx_queue import (
-    LwdUcxTransferQueue,
+from vllm_ascend.distributed.lwd_data_plane.host.host_transfer_queue import (
+    LwdHostTransferQueue,
 )
 
 __all__ = [
-    "LwdUcxTransferQueue",
+    "LwdHostTransferQueue",
     "lwd_data_plane_comm",
     "lwd_data_plane_is_host",
-    "lwd_destroy_ucx_channels",
-    "lwd_get_ucx_io",
-    "lwd_init_ucx_channels",
-    "lwd_ucx_channels_initialized",
+    "lwd_destroy_host_channels",
+    "lwd_get_host_io",
+    "lwd_init_host_channels",
+    "lwd_host_channels_initialized",
+    "lwd_warm_up_host_channels",
 ]

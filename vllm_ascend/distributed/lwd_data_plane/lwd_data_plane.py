@@ -25,13 +25,13 @@ def _queue_class() -> type[LwdTransferQueue]:
     queue implementation (device = HCCL default; host = UCX host-RoCE
     links). Lazy so the UCX stack stays out of the default import path."""
     try:
-        from vllm_ascend.distributed.lwd_data_plane.ucx import (
-            LwdUcxTransferQueue,
+        from vllm_ascend.distributed.lwd_data_plane.host import (
+            LwdHostTransferQueue,
             lwd_data_plane_is_host,
         )
 
         if lwd_data_plane_is_host():
-            return LwdUcxTransferQueue
+            return LwdHostTransferQueue
     except Exception:
         pass
     return LwdTransferQueue

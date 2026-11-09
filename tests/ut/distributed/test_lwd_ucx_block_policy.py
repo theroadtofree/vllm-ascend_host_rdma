@@ -14,7 +14,7 @@ _POLICY = (
     / "vllm_ascend"
     / "distributed"
     / "lwd_data_plane"
-    / "ucx"
+    / "host"
     / "ucx_block_policy.py"
 )
 _spec = importlib.util.spec_from_file_location("ucx_block_policy", _POLICY)

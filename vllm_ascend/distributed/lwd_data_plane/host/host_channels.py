@@ -49,8 +49,8 @@ from vllm.v1.data_comm.ucx_channel import UcxListener
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
-from vllm_ascend.distributed.lwd_data_plane.ucx import ucx_block_policy
-from vllm_ascend.distributed.lwd_data_plane.ucx.ucx_io import NpuUcxChannelIo
+from vllm_ascend.distributed.lwd_data_plane.host import ucx_block_policy
+from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import NpuUcxChannelIo
 
 logger = init_logger(__name__)
 
@@ -119,17 +119,17 @@ def _resolve_up_block_mb() -> int:
         )
     except ucx_block_policy.UcxBlockPolicyError as exc:
         raise RuntimeError(
-            f"[LWD] UCX UP block auto-sizing failed: {exc}"
+            f"[LWD] host UP block auto-sizing failed: {exc}"
         ) from exc
     for warning in plan.warnings:
-        logger.warning("[LWD] UCX block policy: %s", warning)
+        logger.warning("[LWD] host block policy: %s", warning)
     logger.info(
-        "[LWD] UCX UP block resolved: %dMiB (%s)", plan.up_block_mb, plan.source
+        "[LWD] host UP block resolved: %dMiB (%s)", plan.up_block_mb, plan.source
     )
     return plan.up_block_mb
 
 
-def lwd_init_ucx_channels() -> None:
+def lwd_init_host_channels() -> None:
     """Create this process's UCX links from its role identity. Idempotent.
 
     Called by ``lwd_channels.lwd_init_channels`` when the topology
@@ -161,7 +161,7 @@ def lwd_init_ucx_channels() -> None:
             continue  # not this process's connection
         if conn.cloud.data_port is None:
             raise RuntimeError(
-                f"[LWD] UCX data plane requires 'data_port' on the cloud DP "
+                f"[LWD] host data plane requires 'data_port' on the cloud DP "
                 f"(cloud={conn.cloud_id}, dp_idx={conn.dp_idx}); set it in "
                 "the topology file (edges never listen; ctrl_port is "
                 "control-plane only)"
@@ -200,7 +200,7 @@ def lwd_init_ucx_channels() -> None:
         listener.start()
     _UCX_CHANNELS_INITIALIZED = True
     logger.info(
-        "[LWD] UCX data-plane links created for role=%s instance=%d "
+        "[LWD] host data-plane links created for role=%s instance=%d "
         "dp_rank=%d tp_rank=%d (ios=%s)",
         role,
         instance_id,
@@ -211,7 +211,7 @@ def lwd_init_ucx_channels() -> None:
             for e, c, d, ch, op in _UCX_IOS
         ),
     )
-    lwd_warm_up_ucx_channels()
+    lwd_warm_up_host_channels()
 
 
 def _io(
@@ -229,7 +229,7 @@ def _io(
         ) from None
 
 
-def lwd_warm_up_ucx_channels(timeout: float | None = None) -> None:
+def lwd_warm_up_host_channels(timeout: float | None = None) -> None:
     """Wait for every LOCAL link's readiness — no cross-world barrier
     exists to join in host comm (old-branch semantics: the cloud reports
     its listener bound and adopts edges asynchronously; the edge waits
@@ -241,32 +241,32 @@ def lwd_warm_up_ucx_channels(timeout: float | None = None) -> None:
         )
     if not _UCX_IOS:
         logger.info(
-            "[LWD] UCX data-plane: no local links (non-endpoint process)"
+            "[LWD] host data-plane: no local links (non-endpoint process)"
         )
         return
     for key, io in _UCX_IOS.items():
         if not io.wait_ready(timeout=timeout):
             logger.error(
-                "[LWD] UCX link %s NOT ready after %.0fs",
+                "[LWD] host link %s NOT ready after %.0fs",
                 key,
                 timeout,
             )
             raise RuntimeError(
-                f"[LWD] UCX link {key} handshake timed out after "
+                f"[LWD] host link {key} handshake timed out after "
                 f"{timeout:.0f}s"
             )
     logger.info(
-        "[LWD] UCX data-plane warmup done (%d link(s), role-side "
+        "[LWD] host data-plane warmup done (%d link(s), role-side "
         "wait_ready only, no cross-world barrier)",
         len(_UCX_IOS),
     )
 
 
-def lwd_ucx_channels_initialized() -> bool:
+def lwd_host_channels_initialized() -> bool:
     return _UCX_CHANNELS_INITIALIZED
 
 
-def lwd_get_ucx_io(
+def lwd_get_host_io(
     channel: LwdChannelType,
     dp_idx: int = 0,
     op: str = "send",
@@ -288,7 +288,7 @@ def lwd_get_ucx_io(
     return _io(edge_id, cloud_id, dp_idx, channel, op)
 
 
-def lwd_destroy_ucx_channels(timeout: float = 2.0) -> None:
+def lwd_destroy_host_channels(timeout: float = 2.0) -> None:
     global _UCX_CHANNELS_INITIALIZED
     for key, io in list(_UCX_IOS.items()):
         try:
