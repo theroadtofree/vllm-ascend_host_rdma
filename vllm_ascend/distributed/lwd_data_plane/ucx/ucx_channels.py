@@ -9,20 +9,20 @@ carries every DP's unicast ``addr`` and its ``data_port`` (the base of
 its UCX data-plane links), so link endpoints are derived deterministically
 from it — no registry, no address exchange, no extra collectives.
 
-Per DP connection TWO independent UHC1 links exist, one per direction:
-the receiver of a channel serves on its DP's ``data_port`` (used
-exactly as configured — no offset; each DP serves exactly one link,
-the recv link of its own direction: cloud DP serves UP, edge DP serves
-DOWN) and the sender connects to the server's topology address. One
-link is one UcxChannel pair (server end + client end) — the sender's
-``send`` IO and the receiver's ``recv`` IO attach to the SAME link, so
-wire ordering matches the tag/seqno contract. Link identity is verified
-at handshake by a token derived from (dp_idx, channel) — identical on
-both ends of the link.
+Per DP connection TWO independent UHC1 links exist, one per direction
+(UP/DOWN UcxChannels, each with its own UCP ep / IO thread / block
+pool), aligned with the old host_rdma branch's listener model: the
+CLOUD DP of the connection binds ONE ``UcxListener`` on its
+``data_port`` and BOTH links attach to it via ``serve_via`` — the
+handshake token (derived from (dp_idx, channel)) routes each incoming
+TCP connection to the right channel. The EDGE side never listens: both
+its IOs (UP send, DOWN recv) connect out to the cloud port — UHC1 is
+full-duplex, so who binds the handshake socket is independent of the
+data direction.
 
-``data_port`` is required on every DP (the topology's ``ctrl_port``
-belongs to the control plane and is never used here); no env-var port
-base exists.
+``data_port`` is therefore required on CLOUD DPs only (the topology's
+``ctrl_port`` belongs to the control plane and is never used here); no
+env-var port base exists.
 
 Block sizing: DOWN uses VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB; UP resolves
 through ``ucx_block_policy.resolve`` (model hidden_size x
@@ -32,12 +32,15 @@ peers derive the same value from the same config.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import torch.distributed as dist
 from vllm.config import get_current_vllm_config
 from vllm.distributed.lwd import LwdChannelEndpoints, LwdParallelGroupsSpec
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
+from vllm.v1.data_comm.ucx_channel import UcxListener
 
 from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
@@ -48,6 +51,10 @@ logger = init_logger(__name__)
 
 # (dp_idx, channel, op) -> NpuUcxChannelIo, endpoint ranks only
 _UCX_IOS: dict[tuple[int, LwdChannelType, str], NpuUcxChannelIo] = {}
+# dp_idx -> the cloud DP's shared listener (handshake entry only; data
+# flows over RoCE). No stop() exists — the accept thread is a daemon and
+# dies with the process, matching the old branch.
+_UCX_LISTENERS: dict[int, Any] = {}
 _UCX_CHANNELS_INITIALIZED = False
 
 # Handshake token base: nonzero, derived from (dp_idx, channel, op).
@@ -75,33 +82,35 @@ def _link_token(dp_idx: int, channel: LwdChannelType) -> int:
 
 
 def _link_port(data_port: int) -> int:
-    """The DP's data_port is the listener port itself — one port per DP,
-    no offset: each DP serves exactly one link (its direction's recv)."""
+    """The cloud DP's data_port is the listener port itself — one port
+    per DP connection, no offset: both links share one UcxListener."""
     return data_port
 
 
-def _serving_dp_endpoint(
-    endpoints: LwdChannelEndpoints, channel: LwdChannelType, serve_rank: int
+def _cloud_dp_endpoint(
+    endpoints: LwdChannelEndpoints, channel: LwdChannelType
 ) -> tuple[str, int]:
-    """The serving side's (addr, data_port) from the topology: the DP whose
-    first rank is the server. ``data_port`` is mandatory for UCX (it IS
-    the link's listener port); ``ctrl_port`` belongs to the control
-    plane and is never consulted here."""
+    """The cloud DP's (addr, data_port) of this connection — the cloud is
+    the only listener (both links attach to one UcxListener on this
+    port). ``data_port`` is mandatory on cloud DPs for UCX;
+    ``ctrl_port`` belongs to the control plane and is never consulted
+    here."""
     topology = get_current_vllm_config().lwd_config.topology
-    for instance in (*topology.clouds, *topology.edges):
+    cloud_rank = endpoints.cloud_rank
+    for instance in topology.clouds:
         for dp in instance.dp:
-            if dp.ranks and dp.ranks[0] == serve_rank:
+            if dp.ranks and dp.ranks[0] == cloud_rank:
                 if dp.data_port is None:
                     raise RuntimeError(
                         f"[LWD] UCX data plane requires 'data_port' on the "
-                        f"serving DP (dp_idx={dp.dp_idx}, addr={dp.addr}) "
-                        f"of every connection; set it in the topology file "
-                        "(ctrl_port is control-plane only)"
+                        f"cloud DP (dp_idx={dp.dp_idx}, addr={dp.addr}); "
+                        f"set it in the topology file (edges never listen; "
+                        "ctrl_port is control-plane only)"
                     )
                 return dp.addr, dp.data_port
     raise RuntimeError(
-        f"[LWD] serving rank {serve_rank} of the {channel.value} link on "
-        f"dp_idx {endpoints.dp_idx} is not the first rank of any topology DP"
+        f"[LWD] cloud rank {cloud_rank} of the {channel.value} link on "
+        f"dp_idx {endpoints.dp_idx} is not the first rank of any cloud DP"
     )
 
 
@@ -148,38 +157,39 @@ def lwd_init_ucx_channels() -> None:
     up_block_mb = _resolve_up_block_mb()
 
     for endpoints in spec.channel_endpoints:
+        # Cloud DP: one shared listener per DP connection; both links
+        # (UP recv / DOWN send) attach to it via serve_via, token-routed.
+        addr, data_port = _cloud_dp_endpoint(
+            endpoints, LwdChannelType.UP
+        )
+        port = _link_port(data_port)
+        listener = None
+        if my_rank == endpoints.cloud_rank:
+            listener = UcxListener(addr, port)
+            _UCX_LISTENERS[endpoints.dp_idx] = listener
         for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
-            # One link per direction: the receiver serves, the sender
-            # connects to the same (addr, port, token) — both ends attach
-            # their op's IO to this one link.
-            recv_rank = (
-                endpoints.cloud_rank if channel is LwdChannelType.UP
-                else endpoints.edge_rank
+            # Edge: UP sender / DOWN receiver, both connect out (the edge
+            # never listens — UHC1 is full-duplex). Cloud: UP receiver /
+            # DOWN sender, both on the shared listener.
+            if my_rank == endpoints.edge_rank:
+                op = "send" if channel is LwdChannelType.UP else "recv"
+                serve = False
+            elif my_rank == endpoints.cloud_rank:
+                op = "recv" if channel is LwdChannelType.UP else "send"
+                serve = True
+            else:
+                continue
+            _UCX_IOS[(endpoints.dp_idx, channel, op)] = NpuUcxChannelIo(
+                channel, op, torch.npu.Stream(),
+                host=addr, port=port, serve=serve,
+                token=_link_token(endpoints.dp_idx, channel),
+                listener=listener, up_block_mb=up_block_mb,
             )
-            send_rank = (
-                endpoints.edge_rank if channel is LwdChannelType.UP
-                else endpoints.cloud_rank
-            )
-            key = (endpoints.dp_idx, channel, "recv")
-            addr, data_port = _serving_dp_endpoint(
-                endpoints, channel, recv_rank
-            )
-            port = _link_port(data_port)
-            token = _link_token(endpoints.dp_idx, channel)
-            if my_rank == recv_rank:
-                _UCX_IOS[key] = NpuUcxChannelIo(
-                    channel, "recv", torch.npu.Stream(),
-                    host=addr, port=port, serve=True,
-                    token=token, up_block_mb=up_block_mb,
-                )
-            elif my_rank == send_rank:
-                _UCX_IOS[(endpoints.dp_idx, channel, "send")] = (
-                    NpuUcxChannelIo(
-                        channel, "send", torch.npu.Stream(),
-                        host=addr, port=port, serve=False,
-                        token=token, up_block_mb=up_block_mb,
-                    )
-                )
+    # Listeners bind at construction; accept loops start only after every
+    # channel has registered its token (UcxListener.register rejects
+    # duplicates, so registration order does not matter).
+    for listener in _UCX_LISTENERS.values():
+        listener.start()
     _UCX_CHANNELS_INITIALIZED = True
     logger.info(
         "[LWD] UCX data-plane links created for %s (my_rank=%d, ios=%s)",
@@ -238,4 +248,7 @@ def lwd_destroy_ucx_channels(timeout: float = 2.0) -> None:
         except Exception:
             logger.warning("[LWD] failed to shut down the UCX IO for %s", key)
     _UCX_IOS.clear()
+    # Listeners have no stop(): their accept threads are daemons and die
+    # with the process; dropping the references is all the cleanup there is.
+    _UCX_LISTENERS.clear()
     _UCX_CHANNELS_INITIALIZED = False

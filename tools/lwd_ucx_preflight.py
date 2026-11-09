@@ -68,8 +68,9 @@ def memory_need_mb(
 
 
 def data_plane_port(data_port: int) -> int:
-    """UCX 链路端口:直接使用 topology 中该 DP 的 data_port(每个 DP
-    恰好服务一条链路,即配置即端口);越界抛 ValueError。"""
+    """UCX 链路端口:直接使用 topology 中云 DP 的 data_port(每个云 DP
+    一个共享 listener,UP/DOWN 两链路经 token 路由共用);越界抛
+    ValueError。"""
     if data_port < 1 or data_port > 65535:
         raise ValueError(
             f"data_port={data_port} invalid: need 1..65535 "
@@ -191,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
         "--data-port",
         type=int,
         default=DEFAULT_DATA_PORT,
-        help="the serving DP's topology data_port (used as configured)",
+        help="the cloud DP's topology data_port (shared listener)",
     )
     parser.add_argument(
         "--model",
