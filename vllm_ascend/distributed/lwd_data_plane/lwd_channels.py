@@ -59,10 +59,11 @@ def lwd_init_channels() -> None:
     # topology; the queue factory in lwd_data_plane picks the matching
     # LwdTransferQueue implementation). Lazy import keeps the UCX stack
     # (libucp ctypes) out of the default HCCL path.
-    if (
-        getattr(lwd_config.topology.deployment, "data_plane_comm", "device")
-        == "host"
-    ):
+    from vllm_ascend.distributed.lwd_data_plane.host.host_channels import (
+        lwd_data_plane_comm,
+    )
+
+    if lwd_data_plane_comm() == "host":  # caches the comm for the request path
         from vllm_ascend.distributed.lwd_data_plane.host import (
             lwd_init_host_channels,
         )

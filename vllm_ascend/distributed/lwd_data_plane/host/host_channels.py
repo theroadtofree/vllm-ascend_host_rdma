@@ -63,15 +63,31 @@ _UCX_LISTENERS: dict[tuple[int, int], Any] = {}
 _UCX_CHANNELS_INITIALIZED = False
 
 
+# Cached at channel-init time (config is only set inside the init
+# context — get_current_vllm_config() RAISES at request time after vLLM
+# clears the current config, so request-path readers must use the cache).
+_CACHED_COMM: str | None = None
+
+
 def lwd_data_plane_comm() -> str:
     """Transport comm selected by the topology file ('device'|'host').
-    The YAML is the single source of truth — there is no env override."""
+    The YAML is the single source of truth — there is no env override.
+
+    The first call MUST happen during channel init (worker init_device),
+    where the current config is guaranteed; it caches the value for the
+    request path, where the global config is no longer set."""
+    global _CACHED_COMM
+    if _CACHED_COMM is not None:
+        return _CACHED_COMM
     lwd_config = get_current_vllm_config().lwd_config
     if lwd_config is None:
-        return "device"
-    return getattr(
-        lwd_config.topology.deployment, "data_plane_comm", "device"
-    )
+        comm = "device"
+    else:
+        comm = getattr(
+            lwd_config.topology.deployment, "data_plane_comm", "device"
+        )
+    _CACHED_COMM = comm
+    return comm
 
 
 def lwd_data_plane_is_host() -> bool:
@@ -406,4 +422,6 @@ def lwd_destroy_host_channels(timeout: float = 2.0) -> None:
         except Exception:
             logger.warning("[LWD] failed to close host listener %s", key)
     _UCX_LISTENERS.clear()
+    global _CACHED_COMM
+    _CACHED_COMM = None
     _UCX_CHANNELS_INITIALIZED = False

@@ -29,29 +29,17 @@ def _queue_class() -> type[LwdTransferQueue]:
     queue implementation must fail loudly here — silently using the
     HCCL queue in host mode would crash later with a confusing
     "holds no channel" error and could mis-pair with the peer."""
-    from vllm.config import get_current_vllm_config
-
-    vllm_config = get_current_vllm_config()
-    lwd_config = getattr(vllm_config, "lwd_config", None)
-    if lwd_config is None:
-        # This MUST never happen in an LWD deployment: the worker already
-        # built the data plane from this same config. Error-level so the
-        # mis-injection is visible immediately at the queue choice.
-        logger.error(
-            "[LWD] _queue_class: get_current_vllm_config()=%s has no "
-            "lwd_config — falling back to the device (HCCL) queue; in a "
-            "host topology this will fail at the first transfer",
-            type(vllm_config).__name__ if vllm_config is not None else None,
-        )
-        return LwdTransferQueue
-    comm = getattr(
-        lwd_config.topology.deployment, "data_plane_comm", "<missing>"
+    # The comm decision is CACHED at channel-init time (worker
+    # init_device, where the current config is set); at request time the
+    # global config is no longer available, so never read it here.
+    from vllm_ascend.distributed.lwd_data_plane.host.host_channels import (
+        lwd_data_plane_comm,
     )
+
+    comm = lwd_data_plane_comm()
     logger.error(
-        "[LWD] _queue_class: role=%s instance=%d data_plane_comm=%r — "
+        "[LWD] _queue_class: data_plane_comm=%r cached at channel init — "
         "selecting the %s queue",
-        lwd_config.role,
-        lwd_config.instance_id,
         comm,
         "host" if comm == "host" else "device (HCCL)",
     )
