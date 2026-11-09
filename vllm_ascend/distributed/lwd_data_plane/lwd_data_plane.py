@@ -21,16 +21,16 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, Lwd
 
 
 def _queue_class() -> type[LwdTransferQueue]:
-    """Transport dispatch: the topology's data_plane_family picks the
-    queue implementation (HCCL default; UCX host-RoCE links). Lazy so
-    the UCX stack stays out of the default import path."""
+    """Transport dispatch: the topology's data_plane_comm picks the
+    queue implementation (device = HCCL default; host = UCX host-RoCE
+    links). Lazy so the UCX stack stays out of the default import path."""
     try:
         from vllm_ascend.distributed.lwd_data_plane.ucx import (
             LwdUcxTransferQueue,
-            lwd_data_plane_is_ucx,
+            lwd_data_plane_is_host,
         )
 
-        if lwd_data_plane_is_ucx():
+        if lwd_data_plane_is_host():
             return LwdUcxTransferQueue
     except Exception:
         pass

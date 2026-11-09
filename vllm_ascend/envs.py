@@ -89,7 +89,7 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
     # ------------------------------------------------------------------ #
     # LWD UCX host-RoCE data plane (active only when the LWD topology
-    # selects data_plane_family=ucx). Ported from the host_rdma branch.  #
+    # selects data_plane_comm: host). Ported from the host_rdma branch.  #
     # ------------------------------------------------------------------ #
     # Per-direction single block size (MB); both peers must agree and it
     # must be >= the largest single frame of that direction. UP carries

@@ -61,16 +61,19 @@ _UCX_CHANNELS_INITIALIZED = False
 _TOKEN_BASE = 0x4C57_0000
 
 
-def lwd_data_plane_family() -> str:
-    """Transport family selected by the topology file ('hccl'|'ucx')."""
+def lwd_data_plane_comm() -> str:
+    """Transport comm selected by the topology file ('device'|'host').
+    The YAML is the single source of truth — there is no env override."""
     lwd_config = get_current_vllm_config().lwd_config
     if lwd_config is None:
-        return "hccl"
-    return getattr(lwd_config.topology, "data_plane_family", "hccl")
+        return "device"
+    return getattr(
+        lwd_config.topology.deployment, "data_plane_comm", "device"
+    )
 
 
-def lwd_data_plane_is_ucx() -> bool:
-    return lwd_data_plane_family() == "ucx"
+def lwd_data_plane_is_host() -> bool:
+    return lwd_data_plane_comm() == "host"
 
 
 def _link_token(dp_idx: int, channel: LwdChannelType) -> int:
@@ -143,7 +146,7 @@ def lwd_init_ucx_channels() -> None:
     """Create the UCX links of every DP connection. Idempotent.
 
     Called by ``lwd_channels.lwd_init_channels`` instead of the HCCL
-    group path when the topology selects ``data_plane_family: ucx``.
+    group path when the topology selects ``data_plane_comm: host``.
     Only the endpoint ranks of each connection create IO objects; the
     world barrier at the end keeps init collective-symmetric.
     """

@@ -53,12 +53,16 @@ def lwd_init_channels() -> None:
         return
     lwd_config = get_current_vllm_config().lwd_config
     assert lwd_config is not None, "the data plane requires lwd_config"
-    # Transport family dispatch: a UCX topology builds UCX links instead
+    # Transport comm dispatch: a host-comm (UCX) topology builds UCX
+    # links instead
     # of HCCL groups (link endpoints derive deterministically from the
     # topology; the queue factory in lwd_data_plane picks the matching
     # LwdTransferQueue implementation). Lazy import keeps the UCX stack
     # (libucp ctypes) out of the default HCCL path.
-    if getattr(lwd_config.topology, "data_plane_family", "hccl") == "ucx":
+    if (
+        getattr(lwd_config.topology.deployment, "data_plane_comm", "device")
+        == "host"
+    ):
         from vllm_ascend.distributed.lwd_data_plane.ucx import (
             lwd_init_ucx_channels,
         )
