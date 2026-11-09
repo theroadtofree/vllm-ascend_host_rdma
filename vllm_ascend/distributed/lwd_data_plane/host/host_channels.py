@@ -250,6 +250,9 @@ def lwd_init_host_channels() -> None:
         )
     dp_rank, tp_rank = _my_dp_identity()
     up_block_mb = _resolve_up_block_mb()
+    _daemon_mode = (
+        str(ascend_envs.VLLM_ASCEND_LWD_UCX_MODE).strip().lower() == "daemon"
+    )
 
     # Host memory budget gate (old branch's _ucx_memory_need_mb): every
     # link owns one pool of N_BLOCKS blocks (send directions reuse their
@@ -290,8 +293,12 @@ def lwd_init_host_channels() -> None:
         port = conn.cloud.data_port  # used exactly as configured
         # Cloud DP: one shared listener per DP connection; both links
         # (UP recv / DOWN send) attach to it via serve_via, token-routed.
+        # Daemon mode is the exception: the listener lives INSIDE the
+        # transport daemon (spawned on demand by ucx_port over the ctl
+        # socket); the engine-side channels ATTACH there instead, so no
+        # engine-side listener may be built (old-branch semantics).
         listener = None
-        if role == "cloud":
+        if role == "cloud" and not _daemon_mode:
             listener = UcxListener(addr, port)
             _UCX_LISTENERS[(conn.cloud_id, conn.dp_idx)] = listener
         for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
@@ -315,9 +322,15 @@ def lwd_init_host_channels() -> None:
             )
     # Listeners bind at construction; accept loops start only after every
     # channel has registered its token (UcxListener.register rejects
-    # duplicates, so registration order does not matter).
+    # duplicates, so registration order does not matter). Daemon mode has
+    # no engine-side listeners (they are owned by the transport daemon).
     for listener in _UCX_LISTENERS.values():
         listener.start()
+    if role == "cloud" and _daemon_mode:
+        logger.info(
+            "[LWD] host daemon mode: listeners owned by ucx_daemon (ports "
+            "%s)", sorted({conn.cloud.data_port for conn in endpoint_conns}),
+        )
     _UCX_CHANNELS_INITIALIZED = True
     logger.info(
         "[LWD] host data-plane links created for role=%s instance=%d "

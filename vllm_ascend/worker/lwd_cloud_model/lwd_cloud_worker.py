@@ -83,9 +83,6 @@ class LwdCloudWorker(LwdWorkerBase):
             )
             == "host"
         ):
-            # Host comm has no global ranks; the endpoint process of a DP
-            # connection is dp_rank == dp_idx and TP rank 0 within the
-            # instance's own world (same rule as host_channels).
             from vllm.distributed.parallel_state import (
                 get_tensor_model_parallel_rank,
             )
