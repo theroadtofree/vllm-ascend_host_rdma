@@ -36,14 +36,7 @@ def _queue_class() -> type[LwdTransferQueue]:
         lwd_data_plane_comm,
     )
 
-    comm = lwd_data_plane_comm()
-    logger.error(
-        "[LWD] _queue_class: data_plane_comm=%r cached at channel init — "
-        "selecting the %s queue",
-        comm,
-        "host" if comm == "host" else "device (HCCL)",
-    )
-    if comm != "host":
+    if lwd_data_plane_comm() != "host":
         return LwdTransferQueue
     from vllm_ascend.distributed.lwd_data_plane.host.host_transfer_queue import (
         LwdHostTransferQueue,
