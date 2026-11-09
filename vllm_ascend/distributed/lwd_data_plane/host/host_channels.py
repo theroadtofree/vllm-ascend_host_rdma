@@ -83,9 +83,7 @@ def lwd_data_plane_comm() -> str:
     if lwd_config is None:
         comm = "device"
     else:
-        comm = getattr(
-            lwd_config.topology.deployment, "data_plane_comm", "device"
-        )
+        comm = lwd_config.topology.deployment.data_plane_comm
     _CACHED_COMM = comm
     return comm
 

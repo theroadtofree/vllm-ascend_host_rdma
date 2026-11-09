@@ -77,12 +77,7 @@ class LwdCloudWorker(LwdWorkerBase):
         assert lwd_config is not None
         self._lwd_dp_idx = self.vllm_config.parallel_config.data_parallel_index
         global_rank = dist.get_rank()
-        if (
-            getattr(
-                lwd_config.topology.deployment, "data_plane_comm", "device"
-            )
-            == "host"
-        ):
+        if lwd_config.topology.is_host_comm:
             from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
             self._lwd_early_recv_endpoint = get_tensor_model_parallel_rank() == 0

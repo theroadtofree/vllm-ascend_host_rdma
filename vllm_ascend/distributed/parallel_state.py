@@ -197,12 +197,7 @@ def _lwd_init_ascend_model_parallel(lwd_config: "LwdConfig", backend: str) -> No
     # rank groups cannot exist (and the topology declares no ranks).
     # Each instance's intra-instance groups come from the regular
     # (non-LWD) parallel init path; nothing to do here.
-    if (
-        getattr(
-            lwd_config.topology.deployment, "data_plane_comm", "device"
-        )
-        == "host"
-    ):
+    if lwd_config.topology.is_host_comm:
         from vllm.logger import init_logger
 
         init_logger(__name__).info(
