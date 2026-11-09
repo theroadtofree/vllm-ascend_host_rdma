@@ -203,7 +203,9 @@ def _lwd_init_ascend_model_parallel(lwd_config: "LwdConfig", backend: str) -> No
         )
         == "host"
     ):
-        logger.info(
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info(
             "[LWD] data_plane_comm=host: skip cross-side MC2/EPLB groups "
             "(no global comm domain)"
         )
