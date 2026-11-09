@@ -88,77 +88,58 @@ env_variables: dict[str, Callable[[], Any]] = {
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
     # ------------------------------------------------------------------ #
-    # LWD UCX host-RoCE data plane (active only when the LWD topology
-    # selects data_plane_comm: host). Ported from the host_rdma branch.  #
+    # LWD host (UCX) data plane — active only when the topology selects  #
+    # data_plane_comm: host. Block-pool sizing:                           #
     # ------------------------------------------------------------------ #
-    # Per-direction single block size (MB); both peers must agree and it
-    # must be >= the largest single frame of that direction. UP carries
-    # prefill chunks (chunk x ~10.5KB), DOWN carries decode-step frames.
-    # When unset, startup auto-sizes UP from model config (see
-    # ucx_block_policy); an explicit value always wins (auto only warns).
+    # Single block size (MB) per direction; must cover the largest single
+    # frame of that direction (UP = prefill chunks, DOWN = decode steps),
+    # identical on both peers. UP auto-sizes from model config when unset
+    # (host_channels._up_block_mb_explicit distinguishes unset/explicit).
     "VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB", 128)
     ),
     "VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB", 32)
     ),
-    # Blocks per channel; larger absorbs early frames / in-flight sends.
-    # Memory = N x block size.
+    # Blocks per channel (memory = N x block size); absorbs early frames.
     "VLLM_ASCEND_LWD_UCX_N_BLOCKS": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_UCX_N_BLOCKS", 4)
     ),
-    # TCP handshake timeout (seconds, >=1); peers may differ. Default 600:
-    # warmup waits for the peer with a budget of this + 5; multi-card cold
-    # starts can take minutes.
-    "VLLM_ASCEND_LWD_UCX_HS_TIMEOUT_S": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_UCX_HS_TIMEOUT_S", 600)
-    ),
-    # RMA put threshold for large frames (bytes); 0=off (default), >0
-    # requires both peers to agree.
-    "VLLM_ASCEND_LWD_UCX_PUT_THRESH": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_UCX_PUT_THRESH", 0)
-    ),
-    # Upper bound of buffered early frames; 0 = N_BLOCKS.
+    # Buffered early-frame bound; 0 = N_BLOCKS.
     "VLLM_ASCEND_LWD_UCX_EARLY_MAX": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_UCX_EARLY_MAX", 4096)
     ),
-    # UCX send-side in-flight quota per link; 0=off (not recommended: a
-    # slow peer inflates host memory).
-    "VLLM_ASCEND_LWD_UCX_MAX_INFLIGHT": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_UCX_MAX_INFLIGHT", 4)
+    # RMA-put large-frame threshold (bytes); 0 = off, >0 needs both peers
+    # to agree.
+    "VLLM_ASCEND_LWD_UCX_PUT_THRESH": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_UCX_PUT_THRESH", 0)
     ),
-    # UCX transport executor: embedded=in-process (default); daemon=
-    # dedicated transport daemon + shm ring. Both peers of a link must use
-    # the same mode; mixed deployments fail at startup (no silent
-    # fallback).
+    # ------------------------------------------------------------------ #
+    # LWD host (UCX) data plane — links & transport executor:             #
+    # ------------------------------------------------------------------ #
+    # UHC1 TCP handshake timeout (seconds); peers may differ. Warmup waits
+    # this + 5s; multi-card cold starts can take minutes.
+    "VLLM_ASCEND_LWD_UCX_HS_TIMEOUT_S": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_UCX_HS_TIMEOUT_S", 600)
+    ),
+    # Transport executor: embedded = in-process (default); daemon =
+    # dedicated transport daemon + shm ring. Both peers must match — mixed
+    # modes fail at startup, no silent fallback.
     "VLLM_ASCEND_LWD_UCX_MODE": lambda: os.getenv(
         "VLLM_ASCEND_LWD_UCX_MODE", "embedded"
     ),
-    # ucx daemon ctl unix socket path; empty = default
-    # /tmp/lwd-host-comm-{uid}.sock.
+    # daemon ctl unix socket path; empty = /tmp/lwd-host-comm-{uid}.sock.
     "VLLM_ASCEND_LWD_HOST_COMM_SOCK": lambda: os.getenv(
         "VLLM_ASCEND_LWD_HOST_COMM_SOCK", ""
     ),
-    # Per-rank data-plane host memory budget (MiB).
+    # Per-rank data-plane host memory budget (MiB); the init-time pool
+    # estimate must fit or startup fails.
     "VLLM_ASCEND_LWD_DP_MEM_BUDGET_MB": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_DP_MEM_BUDGET_MB", 4096)
     ),
 }
 
 # end-env-vars-definition
-
-
-def ucx_up_block_mb_explicit() -> int | None:
-    """Return the explicitly configured UCX UP block, or None for auto.
-
-    ``env_variables`` exposes a default so ordinary callers never see
-    ``None``; block auto-selection needs to distinguish "unset" from an
-    explicit ``128``, hence this raw lookup.
-    """
-    raw = os.getenv("VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB")
-    if raw is None:
-        return None
-    return int(raw)
 
 
 def __getattr__(name: str):

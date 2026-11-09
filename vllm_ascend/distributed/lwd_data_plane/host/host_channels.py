@@ -128,6 +128,18 @@ def _hf_attr(cfg: Any, name: str) -> Any:
     return getattr(cfg, name, None)
 
 
+def _up_block_mb_explicit() -> int | None:
+    """The explicitly configured UP block, or None for auto-sizing.
+
+    ``envs`` exposes a default (128) so ordinary readers never see None;
+    auto-sizing must distinguish "unset" from an explicit "128", hence
+    this raw lookup beside its only consumer."""
+    import os
+
+    raw = os.getenv("VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB")
+    return None if raw is None else int(raw)
+
+
 def _resolve_up_block_mb() -> int:
     """Both peers derive the same UP block from the same model config.
 
@@ -168,7 +180,7 @@ def _resolve_up_block_mb() -> int:
             num_hash_layers=attr("num_hash_layers") or 0,
             num_experts_per_tok=attr("num_experts_per_tok") or 0,
             max_num_batched_tokens=max_num_batched_tokens,
-            explicit_up_block_mb=ascend_envs.ucx_up_block_mb_explicit(),
+            explicit_up_block_mb=_up_block_mb_explicit(),
         )
     except ucx_block_policy.UcxBlockPolicyError as exc:
         raise RuntimeError(
