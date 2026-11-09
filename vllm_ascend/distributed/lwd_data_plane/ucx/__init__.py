@@ -1,7 +1,7 @@
 # Copyright (c) 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 """UCX (host RoCE) backend of the LWD data plane.
 
-Transport core lives in the vllm repo (``vllm/v1/lwd_comm``, pure
+Transport core lives in the vllm repo (``vllm/v1/data_comm``, pure
 Python ctypes over libucp); this package assembles it for NPU:
 ``ucx_io`` (link IO + D2H/H2D orchestration), ``ucx_channels``
 (deterministic topology-derived bootstrap + registry) and
