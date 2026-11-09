@@ -25,7 +25,7 @@ import socket
 import sys
 from pathlib import Path
 
-DEFAULT_PORT_BASE = 5560
+DEFAULT_DATA_PORT = 5560
 DEFAULT_UP_BLOCK_MB = 128
 DEFAULT_DOWN_BLOCK_MB = 32
 DEFAULT_N_BLOCKS = 4
@@ -67,14 +67,15 @@ def memory_need_mb(
     return pairs * n_blocks * (up_block_mb + down_block_mb)
 
 
-def data_plane_port(port_base: int) -> int:
-    """UCX 单端口:直接使用 data_plane_port_base;越界抛 ValueError。"""
-    if port_base < 1 or port_base > 65535:
+def data_plane_port(data_port: int) -> int:
+    """UCX 链路端口:直接使用 topology 中该 DP 的 data_port(每个 DP
+    恰好服务一条链路,即配置即端口);越界抛 ValueError。"""
+    if data_port < 1 or data_port > 65535:
         raise ValueError(
-            f"port_base={port_base} invalid: need 1..65535 "
-            "(single UCX data port)"
+            f"data_port={data_port} invalid: need 1..65535 "
+            "(one listener per DP, used as configured)"
         )
-    return port_base
+    return data_port
 
 
 def _check(ok: bool, name: str, detail: str = "") -> bool:
@@ -86,9 +87,9 @@ def _warn(name: str, detail: str = "") -> None:
     print(f"[WARN] {name}" + (f": {detail}" if detail else ""))
 
 
-def probe_ports(role: str, host: str, port_base: int, timeout: float = 2.0) -> bool:
+def probe_ports(role: str, host: str, data_port: int, timeout: float = 2.0) -> bool:
     """cloud=bind 单端口;edge=connect 单端口。返回是否成功。"""
-    port = data_plane_port(port_base)
+    port = data_plane_port(data_port)
     if role == "cloud":
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -187,9 +188,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--role", choices=("edge", "cloud"), required=True)
     parser.add_argument("--cloud-host", default="")
     parser.add_argument(
-        "--port-base",
+        "--data-port",
         type=int,
-        default=int(os.getenv("VLLM_ASCEND_LWD_DATA_PLANE_PORT_BASE", DEFAULT_PORT_BASE)),
+        default=DEFAULT_DATA_PORT,
+        help="the serving DP's topology data_port (used as configured)",
     )
     parser.add_argument(
         "--model",
@@ -290,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
         up_block_mb = DEFAULT_UP_BLOCK_MB
 
     try:
-        port = data_plane_port(args.port_base)
+        port = data_plane_port(args.data_port)
         ok &= _check(
             True,
             "data plane port",
@@ -318,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
         _warn("UCX_NET_DEVICES", "unset; pin the RDMA NIC explicitly")
 
     if args.probe_ports:
-        ok &= probe_ports(args.role, args.cloud_host, args.port_base)
+        ok &= probe_ports(args.role, args.cloud_host, args.data_port)
 
     print("RESULT:", "PASS" if ok else "FAIL")
     return 0 if ok else 1

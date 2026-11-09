@@ -25,6 +25,9 @@ def test_memory_need_rejects_bad_args():
 
 def test_data_plane_port():
     assert preflight.data_plane_port(5560) == 5560
+    assert preflight.data_plane_port(65535) == 65535
+    with pytest.raises(ValueError):
+        preflight.data_plane_port(0)
     with pytest.raises(ValueError):
         preflight.data_plane_port(65536)
 

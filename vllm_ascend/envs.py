@@ -139,13 +139,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LWD_HOST_COMM_SOCK": lambda: os.getenv(
         "VLLM_ASCEND_LWD_HOST_COMM_SOCK", ""
     ),
-    # Port base for UCX link listeners when the serving DP's topology
-    # ctrl_port is not set. Link port = base + dp_idx*4 + channel/op
-    # offsets; both peers derive it identically. 5560 matches the
-    # preflight tool's (tools/lwd_ucx_preflight.py) planning default.
-    "VLLM_ASCEND_LWD_UCX_PORT_BASE": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_UCX_PORT_BASE", 5560)
-    ),
     # Per-rank data-plane host memory budget (MiB).
     "VLLM_ASCEND_LWD_DP_MEM_BUDGET_MB": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_DP_MEM_BUDGET_MB", 4096)
