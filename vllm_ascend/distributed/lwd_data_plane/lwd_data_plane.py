@@ -20,6 +20,23 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_queue import LwdTransfe
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdTransferRequest
 
 
+def _queue_class() -> type[LwdTransferQueue]:
+    """Transport dispatch: the topology's data_plane_family picks the
+    queue implementation (HCCL default; UCX host-RoCE links). Lazy so
+    the UCX stack stays out of the default import path."""
+    try:
+        from vllm_ascend.distributed.lwd_data_plane.ucx import (
+            LwdUcxTransferQueue,
+            lwd_data_plane_is_ucx,
+        )
+
+        if lwd_data_plane_is_ucx():
+            return LwdUcxTransferQueue
+    except Exception:
+        pass
+    return LwdTransferQueue
+
+
 class LwdDataPlane:
     """Process-wide singleton.  All public methods are thread-safe."""
 
@@ -124,7 +141,7 @@ class LwdDataPlane:
             key = (request.dp_idx, request.channel, request.op)
             queue = self._queues.get(key)
             if queue is None:
-                queue = LwdTransferQueue(request.dp_idx, request.channel, request.op)
+                queue = _queue_class()(request.dp_idx, request.channel, request.op)
                 self._queues[key] = queue
         return queue.submit(request)
 
