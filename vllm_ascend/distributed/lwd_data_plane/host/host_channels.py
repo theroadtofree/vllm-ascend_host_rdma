@@ -25,10 +25,10 @@ Link model (identical to the old branch):
   * endpoint process within an instance: dp_rank == dp_idx and TP rank 0
     (the old branch's "my_rank == 0" with cloud dp=1 is the dp_idx=0
     special case of this rule);
-  * warmup: each side only waits its OWN links' readiness
-    (``wait_ready``, budget = HS_TIMEOUT_S + 5) — NO cross-world
-    barrier exists to join; the cloud just reports the listener bound
-    and adopts edges asynchronously (old branch semantics).
+  * warmup: ONLY the edge waits for its links (``wait_ready``, budget
+    = HS_TIMEOUT_S + 5) — the cloud starts before edges, so it just
+    reports the listener bound and adopts each edge asynchronously as
+    it connects; NO cross-world barrier exists to join.
 
 Block sizing: DOWN uses VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB; UP resolves
 through ``ucx_block_policy.resolve`` (model hidden_size x
@@ -105,7 +105,10 @@ def _my_dp_identity() -> tuple[int, int]:
 
 
 def _hf_attr(cfg: Any, name: str) -> Any:
-    """Attribute of an hf_config (or its nested text_config), or None."""
+    """Attribute of an hf_config (or its nested text_config), or None.
+    Dict configs are supported like the old branch's helper."""
+    if isinstance(cfg, dict):
+        return cfg.get(name)
     return getattr(cfg, name, None)
 
 
@@ -133,27 +136,64 @@ def _resolve_up_block_mb() -> int:
             value = _hf_attr(text_config, name)
         return value
 
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    max_num_batched_tokens = getattr(
+        scheduler_config, "max_num_batched_tokens", None
+    )
+    if max_num_batched_tokens is None:
+        raise RuntimeError(
+            "[LWD] host UP block auto-sizing failed: "
+            "scheduler_config.max_num_batched_tokens is unavailable"
+        )
     try:
         plan = ucx_block_policy.resolve(
             model_type=attr("model_type") or "",
             hidden_size=attr("hidden_size"),
             num_hash_layers=attr("num_hash_layers") or 0,
             num_experts_per_tok=attr("num_experts_per_tok") or 0,
-            max_num_batched_tokens=(
-                vllm_config.scheduler_config.max_num_batched_tokens
-            ),
+            max_num_batched_tokens=max_num_batched_tokens,
             explicit_up_block_mb=ascend_envs.ucx_up_block_mb_explicit(),
         )
     except ucx_block_policy.UcxBlockPolicyError as exc:
         raise RuntimeError(
             f"[LWD] host UP block auto-sizing failed: {exc}"
         ) from exc
+    # Same record format as the old branch's _log_ucx_block_plan (log
+    # analysis tooling parses it).
     for warning in plan.warnings:
-        logger.warning("[LWD] host block policy: %s", warning)
+        logger.warning("[Lwd][ucx-block] %s", warning)
     logger.info(
-        "[LWD] host UP block resolved: %dMiB (%s)", plan.up_block_mb, plan.source
+        "[Lwd][ucx-block] model_type=%s max_num_batched_tokens=%d "
+        "per_token=%d raw=%.1fMiB auto=%dMiB source=%s up_block_mb=%d",
+        plan.model_type or "<unknown>",
+        plan.max_num_batched_tokens,
+        plan.per_token_elements,
+        plan.raw_mib,
+        plan.auto_up_block_mb,
+        plan.source,
+        plan.up_block_mb,
     )
     return plan.up_block_mb
+
+
+def _host_memory_need_mb(
+    channels: int, *, up_block_mb: int | None = None
+) -> int:
+    """Host data-plane memory estimate: one pool per channel (the send
+    direction reuses its channel's pool as D2H staging — pools =
+    channels). ``channels=2`` (UP/DOWN per connection) =>
+    N_BLOCKS x (UP_MB + DOWN_MB) per connection pair. Same formula as
+    the old branch's ``_ucx_memory_need_mb`` and the preflight tool.
+    """
+    n_blocks = int(ascend_envs.VLLM_ASCEND_LWD_UCX_N_BLOCKS)
+    up_mb = (
+        int(up_block_mb)
+        if up_block_mb is not None
+        else int(ascend_envs.VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB)
+    )
+    down_mb = int(ascend_envs.VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB)
+    pairs = channels // 2
+    return pairs * n_blocks * (up_mb + down_mb)
 
 
 def lwd_init_host_channels() -> None:
@@ -183,9 +223,35 @@ def lwd_init_host_channels() -> None:
     dp_rank, tp_rank = _my_dp_identity()
     up_block_mb = _resolve_up_block_mb()
 
-    for conn in connections:
-        if conn.dp_idx != dp_rank or tp_rank != 0:
-            continue  # not this process's connection
+    # Host memory budget gate (old branch's _ucx_memory_need_mb): every
+    # link owns one pool of N_BLOCKS blocks (send directions reuse their
+    # channel's pool as D2H staging, no extra arena), so need =
+    # links/2 * N_BLOCKS * (UP_MB + DOWN_MB). RMA-put mode (PUT_THRESH>0)
+    # adds a control pool on top — budget headroom when enabling it.
+    endpoint_conns = [
+        conn
+        for conn in connections
+        if conn.dp_idx == dp_rank and tp_rank == 0
+    ]
+    links = 2 * len(endpoint_conns)
+    need_mb = _host_memory_need_mb(links, up_block_mb=up_block_mb)
+    limit_mb = int(ascend_envs.VLLM_ASCEND_LWD_DP_MEM_BUDGET_MB)
+    if need_mb > limit_mb:
+        raise RuntimeError(
+            "host data plane memory budget exceeded: "
+            f"need={need_mb}MiB limit={limit_mb}MiB per rank "
+            f"(links={links}, pools={links}, N_BLOCKS="
+            f"{ascend_envs.VLLM_ASCEND_LWD_UCX_N_BLOCKS}, "
+            f"UP_MB={up_block_mb}, DOWN_MB="
+            f"{ascend_envs.VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB}); raise "
+            "VLLM_ASCEND_LWD_DP_MEM_BUDGET_MB or lower N_BLOCKS"
+        )
+    logger.info(
+        "[LWD] host memory plan links=%d pools=%d need=%dMiB limit=%dMiB",
+        links, links, need_mb, limit_mb,
+    )
+
+    for conn in endpoint_conns:
         if conn.cloud.data_port is None:
             raise RuntimeError(
                 f"[LWD] host data plane requires 'data_port' on the cloud DP "
@@ -238,7 +304,18 @@ def lwd_init_host_channels() -> None:
             for e, c, d, ch, op in _UCX_IOS
         ),
     )
-    lwd_warm_up_host_channels()
+    if role == "edge":
+        # Only the EDGE waits for its links (old-branch semantics: the
+        # cloud starts before edges — its listener is bound and each edge
+        # is adopted asynchronously as it connects; blocking here would
+        # deadlock a cloud-first deployment within the warmup timeout).
+        lwd_warm_up_host_channels()
+    else:
+        logger.info(
+            "[LWD] host cloud listener ready; waiting for %d edge link(s) "
+            "asynchronously",
+            len(_UCX_IOS),
+        )
 
 
 def _io(
@@ -271,21 +348,21 @@ def lwd_warm_up_host_channels(timeout: float | None = None) -> None:
             "[LWD] host data-plane: no local links (non-endpoint process)"
         )
         return
-    for key, io in _UCX_IOS.items():
+    import time as _time
+
+    t0 = _time.perf_counter()
+    for (edge_id, cloud_id, dp_idx, channel, op), io in _UCX_IOS.items():
         if not io.wait_ready(timeout=timeout):
-            logger.error(
-                "[LWD] host link %s NOT ready after %.0fs",
-                key,
-                timeout,
-            )
             raise RuntimeError(
-                f"[LWD] host link {key} handshake timed out after "
-                f"{timeout:.0f}s"
+                f"[Lwd][handshake] host link not ready: "
+                f"edge={edge_id} cloud={cloud_id} dp_idx={dp_idx} "
+                f"channel={channel.value} op={op} within {timeout:.0f}s"
             )
     logger.info(
-        "[LWD] host data-plane warmup done (%d link(s), role-side "
-        "wait_ready only, no cross-world barrier)",
+        "[Lwd][handshake] OK data_plane=host links=%d %.1fms "
+        "(edge-side wait_ready only, no cross-world barrier)",
         len(_UCX_IOS),
+        (_time.perf_counter() - t0) * 1000.0,
     )
 
 
@@ -323,7 +400,10 @@ def lwd_destroy_host_channels(timeout: float = 2.0) -> None:
         except Exception:
             logger.warning("[LWD] failed to shut down the UCX IO for %s", key)
     _UCX_IOS.clear()
-    # Listeners have no stop(): their accept threads are daemons and die
-    # with the process; dropping the references is all the cleanup there is.
+    for key, listener in list(_UCX_LISTENERS.items()):
+        try:
+            listener.close()
+        except Exception:
+            logger.warning("[LWD] failed to close host listener %s", key)
     _UCX_LISTENERS.clear()
     _UCX_CHANNELS_INITIALIZED = False
