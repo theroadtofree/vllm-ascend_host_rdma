@@ -54,17 +54,10 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
 logger = init_logger(__name__)
 
-_UP_BLOCK_BYTES = int(ascend_envs.VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB) << 20
-_DOWN_BLOCK_BYTES = int(ascend_envs.VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB) << 20
-_N_BLOCKS = int(ascend_envs.VLLM_ASCEND_LWD_UCX_N_BLOCKS)
+_N_BLOCKS = 4  # blocks per channel (early frames + send backpressure)
 _HS_TIMEOUT_S = 600.0
 
-if min(_UP_BLOCK_BYTES, _DOWN_BLOCK_BYTES) <= 0 or _N_BLOCKS <= 0:
-    raise RuntimeError(
-        "VLLM_ASCEND_LWD_UCX_{UP,DOWN}_BLOCK_MB / N_BLOCKS must be "
-        f"positive, got UP={_UP_BLOCK_BYTES >> 20}MiB "
-        f"DOWN={_DOWN_BLOCK_BYTES >> 20}MiB x {_N_BLOCKS}"
-    )
+
 
 # Reserved tag for frames without a seqno (production request streams all
 # carry seqnos; only defends the queue's non-sequenced path — at most one
@@ -90,7 +83,8 @@ class NpuUcxChannelIo:
         serve: bool = False,
         token: int = 0,
         listener: Any = None,
-        up_block_mb: int | None = None,
+        up_block_mb: int,
+        down_block_mb: int,
     ) -> None:
         self._channel = channel
         self._op = op
@@ -106,16 +100,12 @@ class NpuUcxChannelIo:
         # same value on both peers, verified per-link at handshake).
         _ch_val = getattr(channel, "value", str(channel))
         _is_up = _ch_val == getattr(LwdChannelType.UP, "value", "lwd_up")
-        if _is_up:
-            _block_mb = (
-                int(up_block_mb)
-                if up_block_mb is not None
-                else _UP_BLOCK_BYTES >> 20
-            )
-            _block_env = "VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB"
-        else:
-            _block_mb = _DOWN_BLOCK_BYTES >> 20
-            _block_env = "VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB"
+        _block_mb = int(up_block_mb if _is_up else down_block_mb)
+        _block_env = (
+            "data_plane_comm_up_buffersize"
+            if _is_up
+            else "data_plane_comm_down_buffersize"
+        )
         if _block_mb <= 0:
             raise RuntimeError(
                 f"{self.tag}: {_block_env} must be positive, got "

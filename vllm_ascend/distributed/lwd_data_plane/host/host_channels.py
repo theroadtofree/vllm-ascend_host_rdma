@@ -30,10 +30,10 @@ Link model (identical to the old branch):
     reports the listener bound and adopts each edge asynchronously as
     it connects; NO cross-world barrier exists to join.
 
-Block sizing: DOWN uses VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB; UP resolves
-through ``ucx_block_policy.resolve`` (model hidden_size x
-max_num_batched_tokens auto-sizing, explicit env override wins) — both
-peers derive the same value from the same config.
+Block sizing comes from the topology deployment
+(``data_plane_comm_up/down_buffersize``, host-comm-only fields): UP
+still passes through ``ucx_block_policy.resolve`` so init warns when
+the model needs more than configured; DOWN is used as configured.
 """
 
 from __future__ import annotations
@@ -126,16 +126,13 @@ def _hf_attr(cfg: Any, name: str) -> Any:
     return getattr(cfg, name, None)
 
 
-def _up_block_mb_explicit() -> int | None:
-    """The explicitly configured UP block, or None for auto-sizing.
-
-    ``envs`` exposes a default (128) so ordinary readers never see None;
-    auto-sizing must distinguish "unset" from an explicit "128", hence
-    this raw lookup beside its only consumer."""
-    import os
-
-    raw = os.getenv("VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB")
-    return None if raw is None else int(raw)
+def _deployment_buffersize_mb(name: str) -> int:
+    """A data_plane_comm_*_buffersize field of the topology deployment
+    (MB). Host comm validates them as required at load time."""
+    lwd_config = get_current_vllm_config().lwd_config
+    value = getattr(lwd_config.topology.deployment, name)
+    assert value is not None, f"topology requires {name} in host comm"
+    return int(value)
 
 
 def _resolve_up_block_mb() -> int:
@@ -178,7 +175,9 @@ def _resolve_up_block_mb() -> int:
             num_hash_layers=attr("num_hash_layers") or 0,
             num_experts_per_tok=attr("num_experts_per_tok") or 0,
             max_num_batched_tokens=max_num_batched_tokens,
-            explicit_up_block_mb=_up_block_mb_explicit(),
+            explicit_up_block_mb=_deployment_buffersize_mb(
+                "data_plane_comm_up_buffersize"
+            ),
         )
     except ucx_block_policy.UcxBlockPolicyError as exc:
         raise RuntimeError(
@@ -207,7 +206,7 @@ _HOST_MEM_BUDGET_MB = 12 * 1024
 
 
 def _host_memory_need_mb(
-    channels: int, *, up_block_mb: int | None = None
+    channels: int, *, up_block_mb: int, down_block_mb: int
 ) -> int:
     """Host data-plane memory estimate: one pool per channel (the send
     direction reuses its channel's pool as D2H staging — pools =
@@ -215,15 +214,14 @@ def _host_memory_need_mb(
     N_BLOCKS x (UP_MB + DOWN_MB) per connection pair. Same formula as
     the old branch's ``_ucx_memory_need_mb``.
     """
-    n_blocks = int(ascend_envs.VLLM_ASCEND_LWD_UCX_N_BLOCKS)
-    up_mb = (
-        int(up_block_mb)
-        if up_block_mb is not None
-        else int(ascend_envs.VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB)
+    from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import (
+        _N_BLOCKS,
     )
-    down_mb = int(ascend_envs.VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB)
+
+    up_mb = int(up_block_mb)
+    down_mb = int(down_block_mb)
     pairs = channels // 2
-    return pairs * n_blocks * (up_mb + down_mb)
+    return pairs * _N_BLOCKS * (up_mb + down_mb)
 
 
 def lwd_init_host_channels() -> None:
@@ -252,6 +250,9 @@ def lwd_init_host_channels() -> None:
         )
     dp_rank, tp_rank = _my_dp_identity()
     up_block_mb = _resolve_up_block_mb()
+    down_block_mb = _deployment_buffersize_mb(
+        "data_plane_comm_down_buffersize"
+    )
     _daemon_mode = (
         str(ascend_envs.VLLM_ASCEND_LWD_UCX_MODE).strip().lower() == "daemon"
     )
@@ -266,17 +267,18 @@ def lwd_init_host_channels() -> None:
         if conn.dp_idx == dp_rank and tp_rank == 0
     ]
     links = 2 * len(endpoint_conns)
-    need_mb = _host_memory_need_mb(links, up_block_mb=up_block_mb)
+    need_mb = _host_memory_need_mb(
+        links, up_block_mb=up_block_mb, down_block_mb=down_block_mb
+    )
     limit_mb = _HOST_MEM_BUDGET_MB
     if need_mb > limit_mb:
         raise RuntimeError(
             "host data plane memory budget exceeded: "
             f"need={need_mb}MiB limit={limit_mb}MiB per rank "
             f"(links={links}, pools={links}, N_BLOCKS="
-            f"{ascend_envs.VLLM_ASCEND_LWD_UCX_N_BLOCKS}, "
-            f"UP_MB={up_block_mb}, DOWN_MB="
-            f"{ascend_envs.VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB}); lower "
-            "N_BLOCKS or the block sizes"
+            f"N_BLOCKS=4, "
+            f"UP_MB={up_block_mb}, DOWN_MB={down_block_mb}); lower "
+            "the block sizes in the topology file"
         )
     logger.info(
         "[LWD] host memory plan links=%d pools=%d need=%dMiB limit=%dMiB",
@@ -320,6 +322,7 @@ def lwd_init_host_channels() -> None:
                     token=_link_token(conn.edge_id, conn.cloud_id,
                                       conn.dp_idx, channel),
                     listener=listener, up_block_mb=up_block_mb,
+                    down_block_mb=down_block_mb,
                 )
             )
     # Listeners bind at construction; accept loops start only after every

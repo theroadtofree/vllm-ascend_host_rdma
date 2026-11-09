@@ -89,24 +89,8 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
     # ------------------------------------------------------------------ #
     # LWD host (UCX) data plane — active only when the topology selects  #
-    # data_plane_comm: host. Block-pool sizing:                           #
-    # ------------------------------------------------------------------ #
-    # Single block size (MB) per direction; must cover the largest single
-    # frame of that direction (UP = prefill chunks, DOWN = decode steps),
-    # identical on both peers. UP auto-sizes from model config when unset
-    # (host_channels._up_block_mb_explicit distinguishes unset/explicit).
-    "VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB", 128)
-    ),
-    "VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB", 32)
-    ),
-    # Blocks per channel (memory = N x block size); absorbs early frames.
-    "VLLM_ASCEND_LWD_UCX_N_BLOCKS": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_UCX_N_BLOCKS", 4)
-    ),
-    # ------------------------------------------------------------------ #
-    # LWD host (UCX) data plane — links & transport executor:             #
+    # data_plane_comm: host. Block sizes live in the topology deployment #
+    # (data_plane_comm_up/down_buffersize); N_BLOCKS is a code constant. #
     # ------------------------------------------------------------------ #
     # Transport executor: embedded = in-process (default); daemon =
     # dedicated transport daemon + shm ring. Both peers must match — mixed
