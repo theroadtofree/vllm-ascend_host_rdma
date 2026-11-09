@@ -2,8 +2,7 @@
 """LWD UCX UP block policy.
 
 Pure standard-library policy shared by the runtime UCX data plane and the
-standalone preflight tool. Keep this module free of torch/vllm imports so
-``tools/lwd_ucx_preflight.py`` can run without an installed engine.
+standalone tooling. Keep this module free of torch/vllm imports.
 """
 
 from __future__ import annotations

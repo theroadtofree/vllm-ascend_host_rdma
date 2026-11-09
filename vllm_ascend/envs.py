@@ -114,15 +114,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LWD_UCX_MODE": lambda: os.getenv(
         "VLLM_ASCEND_LWD_UCX_MODE", "embedded"
     ),
-    # daemon ctl unix socket path; empty = /tmp/lwd-host-comm-{uid}.sock.
-    "VLLM_ASCEND_LWD_HOST_COMM_SOCK": lambda: os.getenv(
-        "VLLM_ASCEND_LWD_HOST_COMM_SOCK", ""
-    ),
-    # Per-rank data-plane host memory budget (MiB); the init-time pool
-    # estimate must fit or startup fails.
-    "VLLM_ASCEND_LWD_DP_MEM_BUDGET_MB": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_DP_MEM_BUDGET_MB", 4096)
-    ),
 }
 
 # end-env-vars-definition

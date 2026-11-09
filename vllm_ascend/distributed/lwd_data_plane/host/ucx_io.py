@@ -144,7 +144,6 @@ class NpuUcxChannelIo:
             host=host,
             port=port,
             listener=listener,
-            ctl_sock=str(ascend_envs.VLLM_ASCEND_LWD_HOST_COMM_SOCK),
         )
         # No on_peer_restart registration (U1): transport-layer reconnect
         # is kept, but recovery is not promised.

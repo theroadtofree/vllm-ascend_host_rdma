@@ -202,6 +202,10 @@ def _resolve_up_block_mb() -> int:
     return plan.up_block_mb
 
 
+# 每 rank 数据面 host 内存预算(MiB):初始化期池估算超限即拒绝启动。
+_HOST_MEM_BUDGET_MB = 12 * 1024
+
+
 def _host_memory_need_mb(
     channels: int, *, up_block_mb: int | None = None
 ) -> int:
@@ -209,7 +213,7 @@ def _host_memory_need_mb(
     direction reuses its channel's pool as D2H staging — pools =
     channels). ``channels=2`` (UP/DOWN per connection) =>
     N_BLOCKS x (UP_MB + DOWN_MB) per connection pair. Same formula as
-    the old branch's ``_ucx_memory_need_mb`` and the preflight tool.
+    the old branch's ``_ucx_memory_need_mb``.
     """
     n_blocks = int(ascend_envs.VLLM_ASCEND_LWD_UCX_N_BLOCKS)
     up_mb = (
@@ -263,7 +267,7 @@ def lwd_init_host_channels() -> None:
     ]
     links = 2 * len(endpoint_conns)
     need_mb = _host_memory_need_mb(links, up_block_mb=up_block_mb)
-    limit_mb = int(ascend_envs.VLLM_ASCEND_LWD_DP_MEM_BUDGET_MB)
+    limit_mb = _HOST_MEM_BUDGET_MB
     if need_mb > limit_mb:
         raise RuntimeError(
             "host data plane memory budget exceeded: "
@@ -271,8 +275,8 @@ def lwd_init_host_channels() -> None:
             f"(links={links}, pools={links}, N_BLOCKS="
             f"{ascend_envs.VLLM_ASCEND_LWD_UCX_N_BLOCKS}, "
             f"UP_MB={up_block_mb}, DOWN_MB="
-            f"{ascend_envs.VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB}); raise "
-            "VLLM_ASCEND_LWD_DP_MEM_BUDGET_MB or lower N_BLOCKS"
+            f"{ascend_envs.VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB}); lower "
+            "N_BLOCKS or the block sizes"
         )
     logger.info(
         "[LWD] host memory plan links=%d pools=%d need=%dMiB limit=%dMiB",
