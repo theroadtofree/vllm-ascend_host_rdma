@@ -105,23 +105,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_LWD_UCX_N_BLOCKS": lambda: int(
         os.getenv("VLLM_ASCEND_LWD_UCX_N_BLOCKS", 4)
     ),
-    # Buffered early-frame bound; 0 = N_BLOCKS.
-    "VLLM_ASCEND_LWD_UCX_EARLY_MAX": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_UCX_EARLY_MAX", 4096)
-    ),
-    # RMA-put large-frame threshold (bytes); 0 = off, >0 needs both peers
-    # to agree.
-    "VLLM_ASCEND_LWD_UCX_PUT_THRESH": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_UCX_PUT_THRESH", 0)
-    ),
     # ------------------------------------------------------------------ #
     # LWD host (UCX) data plane — links & transport executor:             #
     # ------------------------------------------------------------------ #
-    # UHC1 TCP handshake timeout (seconds); peers may differ. Warmup waits
-    # this + 5s; multi-card cold starts can take minutes.
-    "VLLM_ASCEND_LWD_UCX_HS_TIMEOUT_S": lambda: int(
-        os.getenv("VLLM_ASCEND_LWD_UCX_HS_TIMEOUT_S", 600)
-    ),
     # Transport executor: embedded = in-process (default); daemon =
     # dedicated transport daemon + shm ring. Both peers must match — mixed
     # modes fail at startup, no silent fallback.

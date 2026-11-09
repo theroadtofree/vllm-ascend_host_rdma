@@ -254,8 +254,7 @@ def lwd_init_host_channels() -> None:
     # Host memory budget gate (old branch's _ucx_memory_need_mb): every
     # link owns one pool of N_BLOCKS blocks (send directions reuse their
     # channel's pool as D2H staging, no extra arena), so need =
-    # links/2 * N_BLOCKS * (UP_MB + DOWN_MB). RMA-put mode (PUT_THRESH>0)
-    # adds a control pool on top — budget headroom when enabling it.
+    # links/2 * N_BLOCKS * (UP_MB + DOWN_MB).
     endpoint_conns = [
         conn
         for conn in connections
@@ -367,10 +366,11 @@ def lwd_warm_up_host_channels(timeout: float | None = None) -> None:
     its listener bound and adopts edges asynchronously; the edge waits
     for every cloud link, bounded by HS_TIMEOUT_S + 5)."""
     if timeout is None:
-        timeout = max(
-            5.0,
-            float(int(ascend_envs.VLLM_ASCEND_LWD_UCX_HS_TIMEOUT_S)) + 5.0,
+        from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import (
+            _HS_TIMEOUT_S,
         )
+
+        timeout = max(5.0, _HS_TIMEOUT_S + 5.0)
     if not _UCX_IOS:
         logger.info(
             "[LWD] host data-plane: no local links (non-endpoint process)"

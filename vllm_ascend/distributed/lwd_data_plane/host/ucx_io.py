@@ -30,11 +30,10 @@ Layering and responsibilities:
     is not wired.
 
 Deployment: both peers must use the same family; UCX 1.22 + pinned TLS.
-The RMA-put large-frame path is enabled via VLLM_ASCEND_LWD_UCX_PUT_THRESH
-(>0 and identical on both peers; default 0 = off).  Block capacity is
-per-direction (envs.py): UP_BLOCK_MB (default 128, carries prefill
-chunks) / DOWN_BLOCK_MB (default 32, carries decode-step frames), same
-value on both peers, verified per-link at handshake.
+The RMA-put large-frame path stays off (UcxCfg.put_thresh default 0);
+block capacity is per-direction (envs.py): UP_BLOCK_MB (default 128,
+carries prefill chunks) / DOWN_BLOCK_MB (default 32, carries decode-step
+frames), same value on both peers, verified per-link at handshake.
 """
 
 from __future__ import annotations
@@ -58,9 +57,7 @@ logger = init_logger(__name__)
 _UP_BLOCK_BYTES = int(ascend_envs.VLLM_ASCEND_LWD_UCX_UP_BLOCK_MB) << 20
 _DOWN_BLOCK_BYTES = int(ascend_envs.VLLM_ASCEND_LWD_UCX_DOWN_BLOCK_MB) << 20
 _N_BLOCKS = int(ascend_envs.VLLM_ASCEND_LWD_UCX_N_BLOCKS)
-_HS_TIMEOUT_S = max(1.0, int(ascend_envs.VLLM_ASCEND_LWD_UCX_HS_TIMEOUT_S))
-_PUT_THRESH = max(0, int(ascend_envs.VLLM_ASCEND_LWD_UCX_PUT_THRESH))
-_EARLY_MAX = int(ascend_envs.VLLM_ASCEND_LWD_UCX_EARLY_MAX)
+_HS_TIMEOUT_S = 600.0
 
 if min(_UP_BLOCK_BYTES, _DOWN_BLOCK_BYTES) <= 0 or _N_BLOCKS <= 0:
     raise RuntimeError(
@@ -129,10 +126,8 @@ class NpuUcxChannelIo:
         cfg = UcxCfg(
             block_mb=self._block_bytes >> 20,
             n_blocks=_N_BLOCKS,
-            put_thresh=_PUT_THRESH,
             hs_timeout_s=_HS_TIMEOUT_S,
             token=token,
-            early_max=_EARLY_MAX,
             # Send-only link: pool blocks are not attached to the
             # wildcard; they serve purely as D2H staging (cycled via
             # acquire_staging/release_staging).
