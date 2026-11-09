@@ -23,18 +23,26 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, Lwd
 def _queue_class() -> type[LwdTransferQueue]:
     """Transport dispatch: the topology's data_plane_comm picks the
     queue implementation (device = HCCL default; host = UCX host-RoCE
-    links). Lazy so the UCX stack stays out of the default import path."""
-    try:
-        from vllm_ascend.distributed.lwd_data_plane.host import (
-            LwdHostTransferQueue,
-            lwd_data_plane_is_host,
-        )
+    links). Lazy so the host stack stays out of the default import path.
 
-        if lwd_data_plane_is_host():
-            return LwdHostTransferQueue
-    except Exception:
-        pass
-    return LwdTransferQueue
+    NEVER fall back silently: a host topology that fails to load its
+    queue implementation must fail loudly here — silently using the
+    HCCL queue in host mode would crash later with a confusing
+    "holds no channel" error and could mis-pair with the peer."""
+    from vllm_ascend.distributed.lwd_data_plane.host.host_channels import (
+        lwd_data_plane_is_host,
+    )
+
+    if not lwd_data_plane_is_host():
+        return LwdTransferQueue
+    from vllm_ascend.distributed.lwd_data_plane.host.host_transfer_queue import (
+        LwdHostTransferQueue,
+    )
+
+    logger.info(
+        "[LWD] data_plane_comm=host: using %s", LwdHostTransferQueue.__name__
+    )
+    return LwdHostTransferQueue
 
 
 class LwdDataPlane:
