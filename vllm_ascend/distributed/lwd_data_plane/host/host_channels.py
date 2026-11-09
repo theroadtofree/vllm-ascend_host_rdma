@@ -104,14 +104,41 @@ def _my_dp_identity() -> tuple[int, int]:
     return int(dp_rank or 0), int(tp_rank)
 
 
+def _hf_attr(cfg: Any, name: str) -> Any:
+    """Attribute of an hf_config (or its nested text_config), or None."""
+    return getattr(cfg, name, None)
+
+
 def _resolve_up_block_mb() -> int:
-    """Both peers derive the same UP block from the same model config."""
+    """Both peers derive the same UP block from the same model config.
+
+    Nested-config fallback mirrors the old branch's
+    ``_resolve_ucx_block_plan``: multimodal/moe models (e.g. qwen3_5)
+    keep the real values inside ``hf_config.text_config``, so every
+    sizing attribute falls back to it when the top level is absent.
+    """
     vllm_config = get_current_vllm_config()
     model_config = vllm_config.model_config
+    hf_config = getattr(model_config, "hf_config", None)
+    if hf_config is None:
+        raise RuntimeError(
+            "[LWD] host UP block auto-sizing failed: model_config.hf_config "
+            "is unavailable"
+        )
+    text_config = _hf_attr(hf_config, "text_config")
+
+    def attr(name: str) -> Any:
+        value = _hf_attr(hf_config, name)
+        if value is None and text_config is not None:
+            value = _hf_attr(text_config, name)
+        return value
+
     try:
         plan = ucx_block_policy.resolve(
-            model_type=model_config.hf_config.model_type,
-            hidden_size=getattr(model_config.hf_config, "hidden_size", None),
+            model_type=attr("model_type") or "",
+            hidden_size=attr("hidden_size"),
+            num_hash_layers=attr("num_hash_layers") or 0,
+            num_experts_per_tok=attr("num_experts_per_tok") or 0,
             max_num_batched_tokens=(
                 vllm_config.scheduler_config.max_num_batched_tokens
             ),
