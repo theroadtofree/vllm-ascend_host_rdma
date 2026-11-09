@@ -83,17 +83,11 @@ class LwdCloudWorker(LwdWorkerBase):
             )
             == "host"
         ):
-            from vllm.distributed.parallel_state import (
-                get_tensor_model_parallel_rank,
-            )
+            from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
-            self._lwd_early_recv_endpoint = (
-                get_tensor_model_parallel_rank() == 0
-            )
+            self._lwd_early_recv_endpoint = get_tensor_model_parallel_rank() == 0
         else:
-            endpoint_rank = (
-                lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
-            )
+            endpoint_rank = lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
             self._lwd_early_recv_endpoint = global_rank == endpoint_rank
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
