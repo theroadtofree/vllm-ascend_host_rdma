@@ -87,17 +87,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
-    # ------------------------------------------------------------------ #
-    # LWD host (UCX) data plane — active only when the topology selects  #
-    # data_plane_comm: host. Block sizes live in the topology deployment #
-    # (data_plane_comm_up/down_buffersize); N_BLOCKS is a code constant. #
-    # ------------------------------------------------------------------ #
-    # Transport executor: embedded = in-process (default); daemon =
-    # dedicated transport daemon + shm ring. Both peers must match — mixed
-    # modes fail at startup, no silent fallback.
-    "VLLM_ASCEND_LWD_UCX_MODE": lambda: os.getenv(
-        "VLLM_ASCEND_LWD_UCX_MODE", "embedded"
-    ),
 }
 
 # end-env-vars-definition

@@ -49,7 +49,6 @@ from vllm.logger import init_logger
 from vllm.v1.lwd_comm.data_comm.ucx_channel import HostDoneEvent, UcxCfg
 from vllm.v1.lwd_comm.data_comm.ucx_port import UcxTransportPort, open_transport
 
-from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
 logger = init_logger(__name__)
@@ -85,6 +84,7 @@ class NpuUcxChannelIo:
         listener: Any = None,
         up_block_mb: int,
         down_block_mb: int,
+        transport_mode: str = "embedded",
     ) -> None:
         self._channel = channel
         self._op = op
@@ -102,9 +102,9 @@ class NpuUcxChannelIo:
         _is_up = _ch_val == getattr(LwdChannelType.UP, "value", "lwd_up")
         _block_mb = int(up_block_mb if _is_up else down_block_mb)
         _block_env = (
-            "data_plane_comm_up_buffersize"
+            "data_plane_host.up_buffersize"
             if _is_up
-            else "data_plane_comm_down_buffersize"
+            else "data_plane_host.down_buffersize"
         )
         if _block_mb <= 0:
             raise RuntimeError(
@@ -129,7 +129,7 @@ class NpuUcxChannelIo:
         # the UcxTransportPort protocol.
         self._ch: UcxTransportPort = open_transport(
             cfg,
-            mode=str(ascend_envs.VLLM_ASCEND_LWD_UCX_MODE).strip().lower(),
+            mode=transport_mode,
             serve=serve,
             host=host,
             port=port,

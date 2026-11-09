@@ -37,18 +37,18 @@ def _send_io(block_bytes: int, env: str):
 
 
 def test_send_frame_over_block_raises_before_queueing() -> None:
-    io = _send_io(128 << 20, "data_plane_comm_up_buffersize")
+    io = _send_io(128 << 20, "data_plane_host.up_buffersize")
     # 20,480 tokens x 4,168 bf16 elements/token = 162.8 MiB.
     tensor = _Tensor(20_480 * 4_168)
 
-    with pytest.raises(RuntimeError, match="data_plane_comm_up_buffersize"):
+    with pytest.raises(RuntimeError, match="data_plane_host.up_buffersize"):
         io.submit_send(2, tensor, None, None, _Future())
 
     assert io._sq.empty()
 
 
 def test_send_frame_within_block_is_queued() -> None:
-    io = _send_io(128 << 20, "data_plane_comm_up_buffersize")
+    io = _send_io(128 << 20, "data_plane_host.up_buffersize")
     tensor = _Tensor(8_000 * 4_168)
 
     io.submit_send(2, tensor, None, None, _Future())

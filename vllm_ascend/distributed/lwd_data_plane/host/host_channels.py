@@ -47,7 +47,6 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.v1.lwd_comm.data_comm.ucx_channel import UcxListener
 
-from vllm_ascend import envs as ascend_envs
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 from vllm_ascend.distributed.lwd_data_plane.host import ucx_block_policy
 from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import NpuUcxChannelIo
@@ -126,13 +125,12 @@ def _hf_attr(cfg: Any, name: str) -> Any:
     return getattr(cfg, name, None)
 
 
-def _deployment_buffersize_mb(name: str) -> int:
-    """A data_plane_comm_*_buffersize field of the topology deployment
-    (MB). Host comm validates them as required at load time."""
-    lwd_config = get_current_vllm_config().lwd_config
-    value = getattr(lwd_config.topology.deployment, name)
-    assert value is not None, f"topology requires {name} in host comm"
-    return int(value)
+def _host_plane():
+    """The topology's ``deployment.data_plane_host`` block (validated as
+    required at load time in host comm)."""
+    host_plane = get_current_vllm_config().lwd_config.topology.deployment.data_plane_host
+    assert host_plane is not None, "topology requires data_plane_host in host comm"
+    return host_plane
 
 
 def _resolve_up_block_mb() -> int:
@@ -175,9 +173,7 @@ def _resolve_up_block_mb() -> int:
             num_hash_layers=attr("num_hash_layers") or 0,
             num_experts_per_tok=attr("num_experts_per_tok") or 0,
             max_num_batched_tokens=max_num_batched_tokens,
-            explicit_up_block_mb=_deployment_buffersize_mb(
-                "data_plane_comm_up_buffersize"
-            ),
+            explicit_up_block_mb=_host_plane().up_buffersize,
         )
     except ucx_block_policy.UcxBlockPolicyError as exc:
         raise RuntimeError(
@@ -250,12 +246,11 @@ def lwd_init_host_channels() -> None:
         )
     dp_rank, tp_rank = _my_dp_identity()
     up_block_mb = _resolve_up_block_mb()
-    down_block_mb = _deployment_buffersize_mb(
-        "data_plane_comm_down_buffersize"
-    )
-    _daemon_mode = (
-        str(ascend_envs.VLLM_ASCEND_LWD_UCX_MODE).strip().lower() == "daemon"
-    )
+    down_block_mb = _host_plane().down_buffersize
+    # Sidecar deployment: a dedicated transport daemon owns the
+    # listeners; engines ATTACH via the ctl socket (transport-internal
+    # vocabulary: "daemon" mode of open_transport).
+    _sidecar = _host_plane().deployment == "sidecar"
 
     # Host memory budget gate (old branch's _ucx_memory_need_mb): every
     # link owns one pool of N_BLOCKS blocks (send directions reuse their
@@ -302,7 +297,7 @@ def lwd_init_host_channels() -> None:
         # socket); the engine-side channels ATTACH there instead, so no
         # engine-side listener may be built (old-branch semantics).
         listener = None
-        if role == "cloud" and not _daemon_mode:
+        if role == "cloud" and not _sidecar:
             listener = UcxListener(addr, port)
             _UCX_LISTENERS[(conn.cloud_id, conn.dp_idx)] = listener
         for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
@@ -323,6 +318,7 @@ def lwd_init_host_channels() -> None:
                                       conn.dp_idx, channel),
                     listener=listener, up_block_mb=up_block_mb,
                     down_block_mb=down_block_mb,
+                    transport_mode="daemon" if _sidecar else "embedded",
                 )
             )
     # Listeners bind at construction; accept loops start only after every
@@ -331,9 +327,10 @@ def lwd_init_host_channels() -> None:
     # no engine-side listeners (they are owned by the transport daemon).
     for listener in _UCX_LISTENERS.values():
         listener.start()
-    if role == "cloud" and _daemon_mode:
+    if role == "cloud" and _sidecar:
         logger.info(
-            "[LWD] host daemon mode: listeners owned by ucx_daemon (ports "
+            "[LWD] host sidecar deployment: listeners owned by the "
+            "transport daemon (ports "
             "%s)", sorted({conn.cloud.data_port for conn in endpoint_conns}),
         )
     _UCX_CHANNELS_INITIALIZED = True
