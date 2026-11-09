@@ -126,10 +126,15 @@ def _hf_attr(cfg: Any, name: str) -> Any:
 
 
 def _host_plane():
-    """The topology's ``deployment.data_plane_host`` block (validated as
-    required at load time in host comm)."""
-    host_plane = get_current_vllm_config().lwd_config.topology.deployment.data_plane_host
-    assert host_plane is not None, "topology requires data_plane_host in host comm"
+    """The topology's ``deployment.data_plane_host`` block; every field
+    (and the block itself) is optional — defaults apply when omitted."""
+    host_plane = (
+        get_current_vllm_config().lwd_config.topology.deployment.data_plane_host
+    )
+    if host_plane is None:
+        from vllm.config.lwd.topology import LwdHostDataPlane
+
+        host_plane = LwdHostDataPlane()
     return host_plane
 
 
