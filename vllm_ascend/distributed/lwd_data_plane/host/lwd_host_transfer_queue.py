@@ -41,7 +41,7 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
     LwdChannelType,
     LwdTransferRequest,
 )
-from vllm_ascend.distributed.lwd_data_plane.host.host_channels import (
+from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import (
     lwd_get_host_io,
 )
 

@@ -32,13 +32,13 @@ def _queue_class() -> type[LwdTransferQueue]:
     # The comm decision is CACHED at channel-init time (worker
     # init_device, where the current config is set); at request time the
     # global config is no longer available, so never read it here.
-    from vllm_ascend.distributed.lwd_data_plane.host.host_channels import (
+    from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import (
         lwd_data_plane_comm,
     )
 
     if lwd_data_plane_comm() != "host":
         return LwdTransferQueue
-    from vllm_ascend.distributed.lwd_data_plane.host.host_transfer_queue import (
+    from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_transfer_queue import (
         LwdHostTransferQueue,
     )
 

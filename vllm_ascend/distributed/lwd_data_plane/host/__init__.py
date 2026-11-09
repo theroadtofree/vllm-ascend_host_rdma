@@ -6,16 +6,16 @@ topology's ``data_plane_comm: host``. UCX is the current implementation
 detail: the transport core lives in the vllm repo (``vllm/v1/lwd_comm/data_comm``,
 pure Python ctypes over libucp), and this package assembles it for NPU:
 
-  * ``host_channels`` — identity-driven bootstrap + registry (the public
+  * ``lwd_host_channels`` — identity-driven bootstrap + registry (the public
     ``lwd_*_host_*`` entry points);
-  * ``host_transfer_queue`` — ``LwdHostTransferQueue``, the
+  * ``lwd_host_transfer_queue`` — ``LwdHostTransferQueue``, the
     ``LwdTransferQueue`` implementation the data-plane factory selects
     for host comm;
   * ``ucx_io`` / ``ucx_block_policy`` — UCX-specific internals (link IO
     + D2H/H2D orchestration, block auto-sizing).
 """
 
-from vllm_ascend.distributed.lwd_data_plane.host.host_channels import (
+from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import (
     lwd_data_plane_comm,
     lwd_data_plane_is_host,
     lwd_destroy_host_channels,
@@ -24,7 +24,7 @@ from vllm_ascend.distributed.lwd_data_plane.host.host_channels import (
     lwd_host_channels_initialized,
     lwd_warm_up_host_channels,
 )
-from vllm_ascend.distributed.lwd_data_plane.host.host_transfer_queue import (
+from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_transfer_queue import (
     LwdHostTransferQueue,
 )
 
