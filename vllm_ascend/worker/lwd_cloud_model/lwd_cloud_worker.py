@@ -76,9 +76,28 @@ class LwdCloudWorker(LwdWorkerBase):
         lwd_config = self.vllm_config.lwd_config
         assert lwd_config is not None
         self._lwd_dp_idx = self.vllm_config.parallel_config.data_parallel_index
-        endpoint_rank = lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
         global_rank = dist.get_rank()
-        self._lwd_early_recv_endpoint = global_rank == endpoint_rank
+        if (
+            getattr(
+                lwd_config.topology.deployment, "data_plane_comm", "device"
+            )
+            == "host"
+        ):
+            # Host comm has no global ranks; the endpoint process of a DP
+            # connection is dp_rank == dp_idx and TP rank 0 within the
+            # instance's own world (same rule as host_channels).
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_rank,
+            )
+
+            self._lwd_early_recv_endpoint = (
+                get_tensor_model_parallel_rank() == 0
+            )
+        else:
+            endpoint_rank = (
+                lwd_config.instance.dp[self._lwd_dp_idx].ranks[0]
+            )
+            self._lwd_early_recv_endpoint = global_rank == endpoint_rank
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
         self._lwd_up_num_experts_per_tok = getattr(self.model_config.hf_config, "num_experts_per_tok", 0)
