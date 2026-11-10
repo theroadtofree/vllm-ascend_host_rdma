@@ -85,6 +85,8 @@ class NpuUcxChannelIo:
         up_block_mb: int,
         down_block_mb: int,
         transport_mode: str = "embedded",
+        traffic_class: int | None = None,
+        sl: int | None = None,
     ) -> None:
         self._channel = channel
         self._op = op
@@ -122,6 +124,8 @@ class NpuUcxChannelIo:
             # wildcard; they serve purely as D2H staging (cycled via
             # acquire_staging/release_staging).
             pool_staging=(op == "send"),
+            traffic_class=traffic_class,
+            sl=sl,
         )
         # Transport executor: embedded = in-process direct UcxChannel
         # (default); daemon = dedicated transport daemon (ucx_daemon +

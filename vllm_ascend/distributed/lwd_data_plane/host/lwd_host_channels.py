@@ -125,6 +125,17 @@ def _hf_attr(cfg: Any, name: str) -> Any:
     return getattr(cfg, name, None)
 
 
+def _qos_data_plane():
+    """The top-level ``qos.data_plane`` block of the topology, or an
+    empty default when omitted (UCX defaults then apply)."""
+    qos = get_current_vllm_config().lwd_config.topology.qos
+    if qos is None or qos.data_plane is None:
+        from vllm.config.lwd.topology import LwdQosDataPlane
+
+        return LwdQosDataPlane()
+    return qos.data_plane
+
+
 def _host_plane():
     """The topology's ``deployment.data_plane_host`` block; every field
     (and the block itself) is optional — defaults apply when omitted."""
@@ -324,6 +335,8 @@ def lwd_init_host_channels() -> None:
                     listener=listener, up_block_mb=up_block_mb,
                     down_block_mb=down_block_mb,
                     transport_mode="daemon" if _sidecar else "embedded",
+                    traffic_class=_qos_data_plane().traffic_class,
+                    sl=_qos_data_plane().sl,
                 )
             )
     # Listeners bind at construction; accept loops start only after every
