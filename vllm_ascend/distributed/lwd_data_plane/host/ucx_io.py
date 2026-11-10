@@ -54,6 +54,12 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 logger = init_logger(__name__)
 
 _N_BLOCKS = 4  # blocks per channel (early frames + send backpressure)
+
+# 早到帧暂存总条数上界(老分支 env 默认 4096):收向"帧已到、对端 recv
+# 尚未预挂"的缓冲深度。prefill 突发下若此值过小,传输层会静默丢弃
+# 全局最早一帧(仅 warning)——数据丢失表现为精度劣化而非报错,必须
+# 足够深;0 = 退化为 n_blocks(4),不可用于生产。
+_EARLY_MAX = 4096
 _HS_TIMEOUT_S = 600.0
 
 
@@ -123,6 +129,7 @@ class NpuUcxChannelIo:
             # Send-only link: pool blocks are not attached to the
             # wildcard; they serve purely as D2H staging (cycled via
             # acquire_staging/release_staging).
+            early_max=_EARLY_MAX,
             pool_staging=(op == "send"),
             traffic_class=traffic_class,
             sl=sl,
@@ -206,6 +213,16 @@ class NpuUcxChannelIo:
         # can never reach the cloud. Queueing it would leave the request
         # awaiting forever because _do_send only finalizes the future.
         self._raise_if_frame_too_large(seqno, tensor, aux_tensor)
+        # Cross-stream ordering (old branch's _execute_ucx contract): the
+        # snapshot clone is enqueued ASYNC on the producer stream by the
+        # caller; the sender thread later D2Hs on THIS channel stream.
+        # Without ordering the channel stream after the producer, the D2H
+        # can race the clone and read half-written bytes — invisible on
+        # single requests (natural scheduling gap) and corrupting under
+        # bench-style back-to-back submits. Must run on the producer
+        # thread BEFORE the task is queued.
+        producer = torch.npu.current_stream()
+        self._stream.wait_stream(producer)
         if self._tr_submit_send:
             self._tr_submit_send = False
             logger.error(
