@@ -19,6 +19,7 @@ import time
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
@@ -88,22 +89,32 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         if not self._lwd_connections:
             self._lwd_connections = (ConnectionId(0, lwd_config.instance.id, self._lwd_dp_idx),)
-        from vllm.distributed.lwd import LwdParallelGroupsSpec
-
         global_rank = dist.get_rank()
-        spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
-        local = set(self._lwd_connections)
-        self._lwd_up_src_ranks = {
-            endpoints.connection_id: endpoints.cloud_rank
-            for endpoints in spec.channel_endpoints
-            if endpoints.connection_id in local
-        }
-        if set(self._lwd_up_src_ranks) != local:
-            raise RuntimeError("[Lwd][cloud-worker] missing channel endpoint for a local connection")
-        self._lwd_early_recv_connections = tuple(
-            connection for connection in self._lwd_connections if self._lwd_up_src_ranks[connection] == global_rank
-        )
-        self._lwd_early_recv_endpoint = bool(self._lwd_early_recv_connections)
+        if lwd_config.topology.is_host_comm:
+            # Host comm has no global ranks: TP0 of this instance world is
+            # the endpoint that owns every local connection's UCX links.
+            is_endpoint = get_tensor_model_parallel_rank() == 0
+            self._lwd_up_src_ranks = {}
+            self._lwd_early_recv_connections = self._lwd_connections if is_endpoint else ()
+            self._lwd_early_recv_endpoint = is_endpoint
+        else:
+            from vllm.distributed.lwd import LwdParallelGroupsSpec
+
+            spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
+            local = set(self._lwd_connections)
+            self._lwd_up_src_ranks = {
+                endpoints.connection_id: endpoints.cloud_rank
+                for endpoints in spec.channel_endpoints
+                if endpoints.connection_id in local
+            }
+            if set(self._lwd_up_src_ranks) != local:
+                raise RuntimeError("[Lwd][cloud-worker] missing channel endpoint for a local connection")
+            self._lwd_early_recv_connections = tuple(
+                connection
+                for connection in self._lwd_connections
+                if self._lwd_up_src_ranks[connection] == global_rank
+            )
+            self._lwd_early_recv_endpoint = bool(self._lwd_early_recv_connections)
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
         self._lwd_up_num_experts_per_tok = getattr(self.model_config.hf_config, "num_experts_per_tok", 0)
