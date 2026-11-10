@@ -213,6 +213,16 @@ class NpuUcxChannelIo:
         # can never reach the cloud. Queueing it would leave the request
         # awaiting forever because _do_send only finalizes the future.
         self._raise_if_frame_too_large(seqno, tensor, aux_tensor)
+        # Cross-stream ordering (old branch's _execute_ucx contract): the
+        # snapshot clone is enqueued ASYNC on the producer stream by the
+        # caller; the sender thread later D2Hs on THIS channel stream.
+        # Without ordering the channel stream after the producer, the D2H
+        # can race the clone and read half-written bytes — invisible on
+        # single requests (natural scheduling gap) and corrupting under
+        # bench-style back-to-back submits. Must run on the producer
+        # thread BEFORE the task is queued.
+        producer = torch.npu.current_stream()
+        self._stream.wait_stream(producer)
         if self._tr_submit_send:
             self._tr_submit_send = False
             logger.error(
