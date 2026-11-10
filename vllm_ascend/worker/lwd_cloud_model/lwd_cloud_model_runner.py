@@ -814,12 +814,21 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         input cannot trip it. ``strict=False`` is for the expert-ID tail
         (bytes may legitimately be zero): retry only, never fail; the retry
         is idempotent. In steady state D2H finished long ago, the first read
-        passes, the retry branch never fires, and the only added cost is one
-        synchronous 16-element read (microseconds); only the cold-start first
-        window pays one extra copy.
+        passes and the retry branch never fires; the standing cost is one
+        blocking copy plus one 16-element read-back on the H2D stream.
+
+        Sync scope: the read-back only needs the *issuing* stream drained,
+        which the blocking ``copy_`` already guarantees, so a stream-level
+        synchronize suffices. Cross-stream visibility towards the compute
+        stream is owned by the ``ready_event`` bridge recorded after the
+        window is staged. A device-wide ``torch.npu.synchronize()`` would
+        additionally park the engine thread behind every unrelated
+        in-flight stream (previous window's forward tail, DOWN sends,
+        early-recv HCCL ops) at each staging point with no correctness
+        gain, and is deliberately avoided here.
         """
         dst.copy_(src, non_blocking=False)
-        torch.npu.synchronize()
+        torch.npu.current_stream().synchronize()
         if float(dst[:16].float().sum().item()) != 0.0:
             return
         lwd_logger.warning(
@@ -828,7 +837,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             rid,
         )
         dst.copy_(src, non_blocking=False)
-        torch.npu.synchronize()
+        torch.npu.current_stream().synchronize()
         if strict and float(dst[:16].float().sum().item()) == 0.0:
             raise RuntimeError(
                 f"[Lwd][cloud-runner] H2D copy lost twice req={rid} "
