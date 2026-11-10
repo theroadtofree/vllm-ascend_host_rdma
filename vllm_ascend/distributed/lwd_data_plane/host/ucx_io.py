@@ -54,6 +54,12 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 logger = init_logger(__name__)
 
 _N_BLOCKS = 4  # blocks per channel (early frames + send backpressure)
+
+# 早到帧暂存总条数上界(老分支 env 默认 4096):收向"帧已到、对端 recv
+# 尚未预挂"的缓冲深度。prefill 突发下若此值过小,传输层会静默丢弃
+# 全局最早一帧(仅 warning)——数据丢失表现为精度劣化而非报错,必须
+# 足够深;0 = 退化为 n_blocks(4),不可用于生产。
+_EARLY_MAX = 4096
 _HS_TIMEOUT_S = 600.0
 
 
@@ -123,6 +129,7 @@ class NpuUcxChannelIo:
             # Send-only link: pool blocks are not attached to the
             # wildcard; they serve purely as D2H staging (cycled via
             # acquire_staging/release_staging).
+            early_max=_EARLY_MAX,
             pool_staging=(op == "send"),
             traffic_class=traffic_class,
             sl=sl,
