@@ -14,11 +14,13 @@ Selected via ``parallel_config.worker_cls`` (see platform.py:
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from typing import TYPE_CHECKING
 
 import torch
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
@@ -88,22 +90,32 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         if not self._lwd_connections:
             self._lwd_connections = (ConnectionId(0, lwd_config.instance.id, self._lwd_dp_idx),)
-        from vllm.distributed.lwd import LwdParallelGroupsSpec
-
         global_rank = dist.get_rank()
-        spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
-        local = set(self._lwd_connections)
-        self._lwd_up_src_ranks = {
-            endpoints.connection_id: endpoints.cloud_rank
-            for endpoints in spec.channel_endpoints
-            if endpoints.connection_id in local
-        }
-        if set(self._lwd_up_src_ranks) != local:
-            raise RuntimeError("[Lwd][cloud-worker] missing channel endpoint for a local connection")
-        self._lwd_early_recv_connections = tuple(
-            connection for connection in self._lwd_connections if self._lwd_up_src_ranks[connection] == global_rank
-        )
-        self._lwd_early_recv_endpoint = bool(self._lwd_early_recv_connections)
+        if lwd_config.topology.is_host_comm:
+            # Host comm has no global ranks: TP0 of this instance world is
+            # the endpoint that owns every local connection's UCX links.
+            is_endpoint = get_tensor_model_parallel_rank() == 0
+            self._lwd_up_src_ranks = {}
+            self._lwd_early_recv_connections = self._lwd_connections if is_endpoint else ()
+            self._lwd_early_recv_endpoint = is_endpoint
+        else:
+            from vllm.distributed.lwd import LwdParallelGroupsSpec
+
+            spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
+            local = set(self._lwd_connections)
+            self._lwd_up_src_ranks = {
+                endpoints.connection_id: endpoints.cloud_rank
+                for endpoints in spec.channel_endpoints
+                if endpoints.connection_id in local
+            }
+            if set(self._lwd_up_src_ranks) != local:
+                raise RuntimeError("[Lwd][cloud-worker] missing channel endpoint for a local connection")
+            self._lwd_early_recv_connections = tuple(
+                connection
+                for connection in self._lwd_connections
+                if self._lwd_up_src_ranks[connection] == global_rank
+            )
+            self._lwd_early_recv_endpoint = bool(self._lwd_early_recv_connections)
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
         self._lwd_up_num_experts_per_tok = getattr(self.model_config.hf_config, "num_experts_per_tok", 0)
@@ -430,14 +442,12 @@ class LwdCloudWorker(LwdWorkerBase):
                 if isinstance(raw_connection, ConnectionId):
                     connection = raw_connection
                 else:
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         connection = ConnectionId(
                             int(hint.get("edge_id", 0)),
                             int(hint.get("cloud_id", 0)),
                             int(hint.get("dp_idx", 0)),
                         )
-                    except (TypeError, ValueError):
-                        pass
             connection = connection or ConnectionId(0, 0, 0)
             try:
                 seqno = int(hint.get("seqno", -1)) if isinstance(hint, dict) else -1
@@ -789,8 +799,10 @@ class LwdCloudWorker(LwdWorkerBase):
 
         AscendSpecDecodeBaseProposer.set_lwd_prompt_embeds_provider(_lwd_prompt_embeds_provider)
 
-    def _lwd_next_down_seqno(self, connection: ConnectionId | int = ConnectionId(0, 0, 0)) -> int:
-        if isinstance(connection, int):
+    def _lwd_next_down_seqno(self, connection: ConnectionId | int | None = None) -> int:
+        if connection is None:
+            connection = ConnectionId(0, 0, 0)
+        elif isinstance(connection, int):
             connection = ConnectionId(0, 0, connection)
         seqno = self._lwd_down_next_seqno.get(connection, 0)
         self._lwd_down_next_seqno[connection] = seqno + 1
