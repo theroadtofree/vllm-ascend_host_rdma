@@ -193,11 +193,6 @@ def _resolve_up_block_mb() -> int:
     return plan.up_block_mb
 
 
-# Per-rank host data-plane memory budget in MiB: an estimate above it fails
-# startup. 12 GiB covers the largest UP/DOWN block pair in use today.
-_HOST_MEM_BUDGET_MB = 12 * 1024
-
-
 def _host_memory_need_mb(channels: int, *, up_block_mb: int, down_block_mb: int) -> int:
     """Host data-plane memory estimate: one pool per channel.
 
@@ -261,14 +256,14 @@ def lwd_init_host_channels() -> None:
     endpoint_conns = [conn for conn in connections if conn.dp_idx == dp_rank and tp_rank == 0]
     links = 2 * len(endpoint_conns)
     need_mb = _host_memory_need_mb(links, up_block_mb=up_block_mb, down_block_mb=down_block_mb)
-    limit_mb = _HOST_MEM_BUDGET_MB
+    limit_mb = _host_plane().memory_budget_mb
     if need_mb > limit_mb:
         raise RuntimeError(
             "host data plane memory budget exceeded: "
             f"need={need_mb}MiB limit={limit_mb}MiB per rank "
             f"(links={links}, pools={links}, blocks_per_channel={BLOCKS_PER_CHANNEL}, "
             f"up_buffer_size={up_block_mb}, down_buffer_size={down_block_mb}); lower "
-            "the block sizes in the topology file"
+            "the block sizes or raise data_plane_host.memory_budget_mb in the topology file"
         )
     logger.info(
         "[LWD] host memory plan links=%d pools=%d need=%dMiB limit=%dMiB",
