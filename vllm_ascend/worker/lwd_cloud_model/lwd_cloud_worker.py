@@ -223,9 +223,17 @@ class LwdCloudWorker(LwdWorkerBase):
             return
         from vllm_ascend.distributed.lwd_data_plane.lwd_types import connection_from
 
-        if connection_from(meta) not in self._lwd_early_recv_connections:
+        connection = connection_from(meta)
+        if connection not in self._lwd_early_recv_connections:
+            lwd_logger.error(
+                "[LWD][cloud-worker] dropped abort notices reqs=%s: carrier connection=%s not in local connections=%s",
+                list(meta.aborted_req_ids or ()),
+                connection,
+                list(self._lwd_early_recv_connections),
+            )
             return
         for req_id in meta.aborted_req_ids or ():
+            lwd_logger.error("[LWD][cloud-worker] dropped abort notices reqs=%s", req_id)
             self._lwd_stager.abort_request(req_id)
 
     # ------------------------------------------------------------------ #
