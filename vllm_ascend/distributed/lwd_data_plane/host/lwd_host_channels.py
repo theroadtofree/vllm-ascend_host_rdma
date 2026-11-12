@@ -4,9 +4,10 @@
 ``data_plane_comm: host`` has no global comm domain: the edge and the cloud run
 as separate torch worlds, so link endpoints derive from identity alone --
 ``lwd_config.role``, ``instance_id`` and the per-connection ``LwdDPConnection``
-from ``topology.connections()`` (which carries addr/data_port/dp_idx directly;
-topology ranks are absent in host mode). No global ranks, no
-LwdParallelGroupsSpec, no world collectives.
+from ``lwd_config.connections`` (which carries addr/data_port/dp_idx directly;
+topology ranks are absent in host mode, and in edge_share the view spans every
+logical edge of the shared engine, not just this instance's links). No global
+ranks, no LwdParallelGroupsSpec, no world collectives.
 
 Link model:
   * per DP connection, TWO UHC1 links (UP/DOWN), each an independent
@@ -36,7 +37,11 @@ from typing import Any
 
 import torch
 from vllm.config import get_current_vllm_config
-from vllm.config.lwd.topology import LwdHostDataPlane, LwdQosDataPlane
+from vllm.config.lwd.topology import (
+    LwdDPConnection,
+    LwdHostDataPlane,
+    LwdQosDataPlane,
+)
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import logger
 from vllm.v1.lwd_comm.data_comm.ucx_channel import LwdUcxListener
@@ -207,12 +212,28 @@ def _host_memory_need_mb(channels: int, *, up_block_mb: int, down_block_mb: int)
     return pairs * BLOCKS_PER_CHANNEL * (up_mb + down_mb)
 
 
+def _ensure_cloud_listener(conn: LwdDPConnection, addr: str, port: int) -> LwdUcxListener:
+    """The cloud DP's shared listener, created on its first connection.
+
+    In cloud_share / lwd_cluster several edges connect to the same
+    (cloud_id, dp_idx) and all of them arrive on the same addr:port, so
+    they must reuse one listener: a second bind would fail with "address
+    already in use" and overwrite the registry entry.
+    """
+    listener = _UCX_LISTENERS.get((conn.cloud_id, conn.dp_idx))
+    if listener is None:
+        listener = LwdUcxListener(addr, port)
+        _UCX_LISTENERS[(conn.cloud_id, conn.dp_idx)] = listener
+    return listener
+
+
 def lwd_init_host_channels() -> None:
     """Create this process's UCX links from its role identity. Idempotent.
 
     Called by ``lwd_channels.lwd_init_channels`` when the topology
-    selects ``data_plane_comm: host``. Identity-driven: an edge instance
-    connects out to every linked cloud DP; a cloud instance binds one
+    selects ``data_plane_comm: host``. Identity-driven: an edge connects out
+    to every linked cloud DP of every logical edge it serves (edge_share: the
+    shared engine owns them all); a cloud instance binds one
     listener per its own DP and adopts edges asynchronously. Only the
     endpoint process (dp_rank == dp_idx, TP rank 0) of a connection creates IO
     objects.
@@ -223,10 +244,14 @@ def lwd_init_host_channels() -> None:
     lwd_config = get_current_vllm_config().lwd_config
     if lwd_config is None:
         raise RuntimeError("[LWD] the host data plane requires lwd_config")
-    topology = lwd_config.topology
     role = lwd_config.role
     instance_id = lwd_config.instance_id
-    connections = topology.connections(role, instance_id)
+    # The LwdConfig view, not the per-instance topology view: in edge_share
+    # the ONE shared edge engine must own every logical edge's connections,
+    # like the scheduler, control plane and queue consumers -- a
+    # per-instance view here would leave the non-primary connections
+    # without IO and fail their submits with "no host send IO".
+    connections = lwd_config.connections
     if not connections:
         raise RuntimeError(f"[LWD] no DP connections for role={role} instance={instance_id}")
     dp_rank, tp_rank = _my_dp_identity()
@@ -270,16 +295,15 @@ def lwd_init_host_channels() -> None:
             )
         addr = conn.cloud.addr
         port = conn.cloud.data_port  # used exactly as configured
-        # Cloud DP: one shared listener per DP connection; both links
-        # (UP recv / DOWN send) attach to it via serve_via, token-routed.
-        # Daemon mode is the exception: the listener lives INSIDE the
-        # transport daemon (spawned on demand by ucx_port over the ctl
-        # socket); the engine-side channels ATTACH there instead, so no
-        # engine-side listener may be built (old-branch semantics).
-        listener = None
-        if role == "cloud" and not _sidecar:
-            listener = LwdUcxListener(addr, port)
-            _UCX_LISTENERS[(conn.cloud_id, conn.dp_idx)] = listener
+        # Cloud DP: one shared listener per cloud DP, NOT per connection --
+        # in cloud_share / lwd_cluster several edges connect to the same
+        # (cloud_id, dp_idx) and must land on the same bound socket; both
+        # links (UP recv / DOWN send) attach to it via serve_via,
+        # token-routed. Daemon mode is the exception: the listener lives
+        # INSIDE the transport daemon (spawned on demand by ucx_port over
+        # the ctl socket); the engine-side channels ATTACH there instead,
+        # so no engine-side listener may be built (old-branch semantics).
+        listener = _ensure_cloud_listener(conn, addr, port) if role == "cloud" and not _sidecar else None
         for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
             # Edge: UP sender / DOWN receiver, both connect out (the edge
             # never listens -- UHC1 is full-duplex). Cloud: UP receiver /
