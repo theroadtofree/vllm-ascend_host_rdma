@@ -260,6 +260,31 @@ def _register_peer_restart(
     io.on_peer_restart(on_restart)
 
 
+def _teardown_cloud_dp(cloud_id: int, dp_idx: int, reason: str) -> None:
+    """Restart verdict from the edge's liveness sweep (phase 2): fail every
+    local IO of that (cloud, dp) so a dead peer holds no zombie endpoint.
+    In-flight ops end with ERROR (the containment settles them per
+    request), the connect side rebuilds, and the peer's fresh session
+    re-adopts when it returns."""
+    ios = [
+        io
+        for (_edge, cid, dp, _channel, _op), io in _UCX_IOS.items()
+        if (cid, dp) == (cloud_id, dp_idx)
+    ]
+    if not ios:
+        return
+    logger.error(
+        "[LWD] cloud restart hook: tearing down %d link(s) of cloud=%d "
+        "dp=%d (%s)",
+        len(ios),
+        cloud_id,
+        dp_idx,
+        reason,
+    )
+    for io in ios:
+        io.force_teardown(reason)
+
+
 def lwd_init_host_channels() -> None:
     """Create this process's UCX links from its role identity. Idempotent.
 
@@ -408,6 +433,14 @@ def lwd_init_host_channels() -> None:
             "[LWD] host cloud listener ready; waiting for %d edge link(s) asynchronously",
             len(_UCX_IOS),
         )
+    # Linked teardown (peer-restart line, phase 2): the edge engine's
+    # liveness verdicts fire this hook. The cloud engine registers it too,
+    # but its IOs never match another cloud's (cloud_id, dp_idx) — no-op.
+    from vllm.v1.lwd_control.lwd_comm.lwd_restart_hooks import (
+        register_cloud_restart_hook,
+    )
+
+    register_cloud_restart_hook(_teardown_cloud_dp)
     _UCX_CHANNELS_INITIALIZED = True
 
 

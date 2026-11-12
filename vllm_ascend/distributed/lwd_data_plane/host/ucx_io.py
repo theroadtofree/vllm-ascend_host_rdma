@@ -299,6 +299,14 @@ class LwdNpuUcxChannelIo:
     def wait_ready(self, timeout: float | None = None) -> bool:
         return self._ch.wait_ready(timeout=timeout)
 
+    def force_teardown(self, reason: str) -> None:
+        """Linked teardown (control-plane restart verdict): tear the link
+        down at once — in-flight ops end with ERROR (the containment
+        catches them per request) and the connect side rebuilds. The
+        daemon port's fail detaches the session instead, so this stays an
+        embedded-mode operation."""
+        self._ch.fail(reason)
+
     def on_peer_restart(self, cb: Callable[[], None]) -> None:
         """Register the peer-restart hook (fires on the transport IO thread
         when the handshake session changes at link adopt). Embedded mode

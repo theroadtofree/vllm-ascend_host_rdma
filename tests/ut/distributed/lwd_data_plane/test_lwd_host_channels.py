@@ -38,16 +38,20 @@ class _FakeListener:
 
 
 class _FakeIo:
-    """Stands in for LwdNpuUcxChannelIo: records the handed-in config and
-    the registered peer-restart hooks."""
+    """Stands in for LwdNpuUcxChannelIo: records the handed-in config, the
+    registered peer-restart hooks and the forced teardowns."""
 
     def __init__(self, channel: LwdChannelType, stream: object, config: LwdNpuUcxChannelIoConfig) -> None:
         self.channel = channel
         self.config = config
         self.peer_restart_cbs: list = []
+        self.forced_teardowns: list = []
 
     def on_peer_restart(self, cb: object) -> None:
         self.peer_restart_cbs.append(cb)
+
+    def force_teardown(self, reason: str) -> None:
+        self.forced_teardowns.append(reason)
 
     def wait_ready(self, timeout: float | None = None) -> bool:
         return True
@@ -344,3 +348,29 @@ def test_missing_cloud_data_port_fails_fast(monkeypatch: pytest.MonkeyPatch) -> 
     )
     with pytest.raises(RuntimeError, match="data_port"):
         _run_init(monkeypatch, topology, role="cloud", instance_id=0)
+
+
+def test_linked_teardown_hook_fails_only_the_restarted_cloud(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The liveness verdict tears down every IO of one (cloud, dp) and
+    nothing else: the OTHER cloud's links keep serving."""
+    from vllm.v1.lwd_control.lwd_comm import lwd_restart_hooks
+
+    hooks: list = []
+    monkeypatch.setattr(
+        lwd_restart_hooks,
+        "register_cloud_restart_hook",
+        hooks.append,
+    )
+    topology = _edge_share_topology()
+    connections = tuple(connection for edge in topology.edges for connection in topology.connections("edge", edge.id))
+    _run_init(monkeypatch, topology, role="edge", instance_id=0, connections=connections)
+    (teardown,) = hooks
+    teardown(1, 0, "heartbeat silent 10s")
+    ios = lwd_host_channels._UCX_IOS
+    # Cloud 1's pair tore down with the verdict; cloud 0's is untouched.
+    assert ios[(1, 1, 0, UP, "send")].forced_teardowns == ["heartbeat silent 10s"]
+    assert ios[(1, 1, 0, DOWN, "recv")].forced_teardowns == ["heartbeat silent 10s"]
+    assert ios[(0, 0, 0, UP, "send")].forced_teardowns == []
+    assert ios[(0, 0, 0, DOWN, "recv")].forced_teardowns == []
+    # A verdict without local IOs is a silent no-op (another edge's cloud).
+    teardown(9, 9, "unrelated")
