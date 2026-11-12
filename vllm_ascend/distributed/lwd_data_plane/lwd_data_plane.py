@@ -178,7 +178,6 @@ class LwdDataPlane:
             queue = self._queues.get(key)
             if queue is None:
                 queue = _queue_class()(request.connection, request.channel, request.op)
-
                 self._queues[key] = queue
                 for seqno in sorted(self._pending_skips.pop(key, ())):
                     queue.skip_seqno(seqno)

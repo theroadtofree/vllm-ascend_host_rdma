@@ -76,6 +76,9 @@ class LwdHostTransferQueue(LwdTransferQueue):
         io = getattr(self, "_ucx_io", None)
         if io is None:
             try:
+                # Resolve the link by the full connection identity: one process
+                # holds several (edge, cloud) pairs on multi-edge/multi-cloud
+                # topologies, and the bare dp_idx lookup is ambiguous there.
                 io = lwd_get_host_io(
                     self.channel_type,
                     self.connection.dp_idx,
@@ -103,8 +106,7 @@ class LwdHostTransferQueue(LwdTransferQueue):
             future = into or LwdTransferFuture(req, [], None)
             future._finalize(
                 error=RuntimeError(
-                    f"no host {self.op} IO for channel "
-                    f"{self.channel_type.value} connection={self.connection}"
+                    f"no host {self.op} IO for channel {self.channel_type.value} connection={self.connection}"
                 )
             )
             return future

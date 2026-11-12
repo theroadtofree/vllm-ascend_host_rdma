@@ -11,8 +11,7 @@ Owns the physical channels (UP edge->cloud, DOWN cloud->edge):
   * init-time warmup of every connection's channels in a fixed global
     order (moves the first-use HCCL rendezvous out of the pipeline, where
     the two sides could otherwise arrive on different channels and
-    deadlock); the warmup payload is an identity echo verified by the
-    receiver.
+    deadlock).
 
 In a single_instance topology the edge process serves every DP
 connection, so its endpoint rank holds the channel pairs of all of them;
@@ -279,7 +278,6 @@ def lwd_destroy_channels() -> None:
         )
 
         lwd_destroy_host_channels()
-        _LWD_ENDPOINTS = ()
         _LWD_CHANNELS_INITIALIZED = False
         return
     for (connection, channel), (group, _) in list(_LWD_CHANNEL_GROUPS.items()):
