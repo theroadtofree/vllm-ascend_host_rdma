@@ -14,6 +14,7 @@ Selected via ``parallel_config.worker_cls`` (see platform.py:
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -441,14 +442,12 @@ class LwdCloudWorker(LwdWorkerBase):
                 if isinstance(raw_connection, ConnectionId):
                     connection = raw_connection
                 else:
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         connection = ConnectionId(
                             int(hint.get("edge_id", 0)),
                             int(hint.get("cloud_id", 0)),
                             int(hint.get("dp_idx", 0)),
                         )
-                    except (TypeError, ValueError):
-                        pass
             connection = connection or ConnectionId(0, 0, 0)
             try:
                 seqno = int(hint.get("seqno", -1)) if isinstance(hint, dict) else -1
@@ -800,8 +799,10 @@ class LwdCloudWorker(LwdWorkerBase):
 
         AscendSpecDecodeBaseProposer.set_lwd_prompt_embeds_provider(_lwd_prompt_embeds_provider)
 
-    def _lwd_next_down_seqno(self, connection: ConnectionId | int = ConnectionId(0, 0, 0)) -> int:
-        if isinstance(connection, int):
+    def _lwd_next_down_seqno(self, connection: ConnectionId | int | None = None) -> int:
+        if connection is None:
+            connection = ConnectionId(0, 0, 0)
+        elif isinstance(connection, int):
             connection = ConnectionId(0, 0, connection)
         seqno = self._lwd_down_next_seqno.get(connection, 0)
         self._lwd_down_next_seqno[connection] = seqno + 1

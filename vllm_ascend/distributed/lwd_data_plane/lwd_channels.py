@@ -172,13 +172,19 @@ def _lwd_echo_handshake_impl(
         phase[0] = "UP receive D2H"
         received = [int(value) for value in recv.cpu().tolist()]
         if received != expected:
-            raise RuntimeError(f"[LWD] channel identity/version mismatch on {connection}: expected {expected}, got {received}")
+            raise RuntimeError(
+                f"[LWD] channel identity/version mismatch on {connection}: "
+                f"expected {expected}, got {received}"
+            )
         send_work = dist.isend(recv, dst=down_peer, group=down_group)
         phase[0] = "DOWN echo send wait"
         send_work.wait()
     phase[0] = "echo verification D2H"
     if not torch.equal(recv.cpu(), torch.tensor(expected, dtype=torch.int32)):
-        raise RuntimeError(f"[LWD] channel echo mismatch on {connection}: expected {expected}, got {recv.cpu().tolist()}")
+        raise RuntimeError(
+            f"[LWD] channel echo mismatch on {connection}: "
+            f"expected {expected}, got {recv.cpu().tolist()}"
+        )
 
 
 def lwd_warm_up_channels() -> None:
