@@ -20,7 +20,7 @@ import time
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+from vllm.distributed.parallel_state import get_tensor_model_parallel_rank, get_tp_group
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
@@ -92,10 +92,15 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_connections = (ConnectionId(0, lwd_config.instance.id, self._lwd_dp_idx),)
         global_rank = dist.get_rank()
         if lwd_config.topology.is_host_comm:
-            # Host comm has no global ranks: TP0 of this instance world is
-            # the endpoint that owns every local connection's UCX links.
+            # Host comm has no global LWD ranks: TP0 of this instance world is
+            # the endpoint that owns every local connection's UCX links. The
+            # harvest path still gates on the endpoint's rank and broadcasts
+            # the staged window inside the TP group, so map every local
+            # connection to this DP's TP0 rank in the instance world -- the
+            # role the global cloud_rank plays in device comm.
             is_endpoint = get_tensor_model_parallel_rank() == 0
-            self._lwd_up_src_ranks = {}
+            endpoint_rank = get_tp_group().ranks[0]
+            self._lwd_up_src_ranks = {connection: endpoint_rank for connection in self._lwd_connections}
             self._lwd_early_recv_connections = self._lwd_connections if is_endpoint else ()
             self._lwd_early_recv_endpoint = is_endpoint
         else:
