@@ -4,9 +4,10 @@
 ``data_plane_comm: host`` has no global comm domain: the edge and the cloud run
 as separate torch worlds, so link endpoints derive from identity alone --
 ``lwd_config.role``, ``instance_id`` and the per-connection ``LwdDPConnection``
-from ``topology.connections()`` (which carries addr/data_port/dp_idx directly;
-topology ranks are absent in host mode). No global ranks, no
-LwdParallelGroupsSpec, no world collectives.
+from ``lwd_config.connections`` (which carries addr/data_port/dp_idx directly;
+topology ranks are absent in host mode, and in edge_share the view spans every
+logical edge of the shared engine, not just this instance's links). No global
+ranks, no LwdParallelGroupsSpec, no world collectives.
 
 Link model:
   * per DP connection, TWO UHC1 links (UP/DOWN), each an independent
@@ -230,8 +231,9 @@ def lwd_init_host_channels() -> None:
     """Create this process's UCX links from its role identity. Idempotent.
 
     Called by ``lwd_channels.lwd_init_channels`` when the topology
-    selects ``data_plane_comm: host``. Identity-driven: an edge instance
-    connects out to every linked cloud DP; a cloud instance binds one
+    selects ``data_plane_comm: host``. Identity-driven: an edge connects out
+    to every linked cloud DP of every logical edge it serves (edge_share: the
+    shared engine owns them all); a cloud instance binds one
     listener per its own DP and adopts edges asynchronously. Only the
     endpoint process (dp_rank == dp_idx, TP rank 0) of a connection creates IO
     objects.
@@ -242,10 +244,14 @@ def lwd_init_host_channels() -> None:
     lwd_config = get_current_vllm_config().lwd_config
     if lwd_config is None:
         raise RuntimeError("[LWD] the host data plane requires lwd_config")
-    topology = lwd_config.topology
     role = lwd_config.role
     instance_id = lwd_config.instance_id
-    connections = topology.connections(role, instance_id)
+    # The LwdConfig view, not the per-instance topology view: in edge_share
+    # the ONE shared edge engine must own every logical edge's connections,
+    # like the scheduler, control plane and queue consumers -- a
+    # per-instance view here would leave the non-primary connections
+    # without IO and fail their submits with "no host send IO".
+    connections = lwd_config.connections
     if not connections:
         raise RuntimeError(f"[LWD] no DP connections for role={role} instance={instance_id}")
     dp_rank, tp_rank = _my_dp_identity()

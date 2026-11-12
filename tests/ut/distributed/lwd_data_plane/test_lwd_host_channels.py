@@ -133,6 +133,31 @@ def _lwd_cluster_topology() -> LwdTopology:
     )
 
 
+def _edge_share_topology() -> LwdTopology:
+    """Two 1:1 edge/cloud pairs -- the multi-frontend shared-engine scene."""
+    return LwdTopology.from_dict(
+        {
+            "deployment": {
+                "mode": 0,
+                "scene": "edge_share",
+                "edges_num": 2,
+                "clouds_num": 2,
+                "data_plane_comm": "host",
+            },
+            "feature_ctrl": {},
+            "edges": [
+                {"id": 0, "dp": [{"dp_idx": 0, "addr": "10.0.0.1"}]},
+                {"id": 1, "dp": [{"dp_idx": 0, "addr": "10.0.0.1"}]},
+            ],
+            "clouds": [
+                {"id": 0, "dp": [{"dp_idx": 0, "addr": "10.1.0.1", "ctrl_port": 7000, "data_port": 5560}]},
+                {"id": 1, "dp": [{"dp_idx": 0, "addr": "10.1.0.2", "ctrl_port": 7000, "data_port": 5560}]},
+            ],
+            "instance_links": [{"edge": 0, "cloud": 0}, {"edge": 1, "cloud": 1}],
+        }
+    )
+
+
 def _run_init(
     monkeypatch: pytest.MonkeyPatch,
     topology: LwdTopology | SimpleNamespace,
@@ -141,6 +166,7 @@ def _run_init(
     instance_id: int,
     dp_rank: int = 0,
     tp_rank: int = 0,
+    connections: tuple[LwdDPConnection, ...] | None = None,
 ) -> list[_FakeListener]:
     """Run the bootstrap with fake listeners, IOs and identity; return the binds."""
     made_listeners: list[_FakeListener] = []
@@ -150,8 +176,15 @@ def _run_init(
         made_listeners.append(listener)
         return listener
 
+    if connections is None:
+        connections = topology.connections(role, instance_id)
     vllm_config = SimpleNamespace(
-        lwd_config=SimpleNamespace(topology=topology, role=role, instance_id=instance_id),
+        lwd_config=SimpleNamespace(
+            topology=topology,
+            role=role,
+            instance_id=instance_id,
+            connections=connections,
+        ),
         parallel_config=SimpleNamespace(data_parallel_rank=dp_rank),
     )
     monkeypatch.setattr(lwd_host_channels, "get_current_vllm_config", lambda: vllm_config)
@@ -219,6 +252,26 @@ def test_edge_role_connects_out_without_listeners(monkeypatch: pytest.MonkeyPatc
     assert ios[(0, 0, 0, UP, "send")].config.host == "10.1.0.1"
     assert ios[(0, 1, 0, UP, "send")].config.host == "10.1.0.2"
     assert {io.config.port for io in ios.values()} == {5560}
+
+
+def test_edge_share_shared_engine_owns_every_logical_edge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ONE physical edge engine serves both frontends: it must hold the IOs
+    of every logical edge's connections, not just the primary's -- otherwise a
+    request from frontend 1 fails its UP submit with "no host send IO"."""
+    topology = _edge_share_topology()
+    connections = tuple(connection for edge in topology.edges for connection in topology.connections("edge", edge.id))
+    _run_init(monkeypatch, topology, role="edge", instance_id=0, connections=connections)
+    assert lwd_host_channels._UCX_LISTENERS == {}
+    ios = lwd_host_channels._UCX_IOS
+    assert set(ios) == {
+        (0, 0, 0, UP, "send"),
+        (0, 0, 0, DOWN, "recv"),
+        (1, 1, 0, UP, "send"),
+        (1, 1, 0, DOWN, "recv"),
+    }
+    # Each logical edge connects out to ITS OWN cloud, not only the primary's.
+    assert ios[(0, 0, 0, UP, "send")].config.host == "10.1.0.1"
+    assert ios[(1, 1, 0, UP, "send")].config.host == "10.1.0.2"
 
 
 def test_sidecar_cloud_attaches_without_an_engine_listener(
