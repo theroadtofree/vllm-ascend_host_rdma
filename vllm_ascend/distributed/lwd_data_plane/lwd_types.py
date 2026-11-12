@@ -10,6 +10,13 @@ from typing import Any, Literal
 from vllm.config.lwd.topology import LwdConnectionId as ConnectionId
 
 
+class LwdLinkError(ConnectionError):
+    """A transport link failure (peer restart or network outage) as opposed
+    to an application-level error. Consumers classify on this type: link
+    failures stay transient (the peer is coming back, no permanent marking),
+    while protocol violations and the like keep the failure path."""
+
+
 def connection_from(metadata: Any) -> ConnectionId:
     """Read canonical batch identity, falling back at the legacy boundary."""
     connection = getattr(metadata, "connection_id", None)

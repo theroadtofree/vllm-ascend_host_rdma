@@ -32,6 +32,7 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransf
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
     ConnectionId,
     LwdChannelType,
+    LwdLinkError,
     LwdTransferRequest,
 )
 from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
@@ -76,6 +77,14 @@ def drop_endpoint_early_recv(connection: ConnectionId) -> None:
         lwd_logger.error("[LWD][pre-recv] early-recv drop MISS: no endpoint worker for %s", connection)
         return
     worker.drop_connection_early_recv(connection)
+
+
+def _link_error_cause(exc: BaseException) -> LwdLinkError | None:
+    """The transport link failure behind a future's RuntimeError wrapper,
+    or None for application-level errors (protocol violations and the
+    like), which keep the permanent failure path."""
+    cause = exc.__cause__ if isinstance(exc, RuntimeError) else exc
+    return cause if isinstance(cause, LwdLinkError) else None
 
 
 class LwdCloudWorker(LwdWorkerBase):
@@ -378,14 +387,14 @@ class LwdCloudWorker(LwdWorkerBase):
                 except TimeoutError:
                     continue
                 except Exception as exc:
-                    self._lwd_fail_early_recv_connection(connection, self._early_recv_error_seqno(connection), exc)
+                    self._lwd_route_early_recv_error(connection, self._early_recv_error_seqno(connection), exc)
                     time.sleep(_LWD_EARLY_RECV_ERROR_SLEEP_S)
             try:
                 self._report_irecv_completions()
             except Exception as exc:
                 key = self._early_recv_current_key
                 connection = key[0] if key is not None else ConnectionId(0, 0, 0)
-                self._lwd_fail_early_recv_connection(connection, self._early_recv_error_seqno(connection), exc)
+                self._lwd_route_early_recv_error(connection, self._early_recv_error_seqno(connection), exc)
             if hint_mqs and all(connection in self._early_recv_failed_connections for connection in hint_mqs):
                 return
             # The ring's read side sched_yield-spins within the
@@ -435,6 +444,36 @@ class LwdCloudWorker(LwdWorkerBase):
             except Exception:
                 lwd_logger.exception("[LWD][pre-recv] failed to clean host staging connection=%s", connection)
         lwd_logger.error("[LWD][pre-recv] early-recv ledger dropped connection=%s (peer restarted)", connection)
+
+    def _lwd_route_early_recv_error(self, connection: ConnectionId, seqno: int, exc: Exception) -> None:
+        """Link-class transport failures stay transient (the peer is coming
+        back, no failed marking); application errors keep the permanent
+        failure path."""
+        if _link_error_cause(exc) is not None:
+            self._lwd_link_error_early_recv(connection, seqno, exc)
+        else:
+            self._lwd_fail_early_recv_connection(connection, seqno, exc)
+
+    def _lwd_link_error_early_recv(self, connection: ConnectionId, seqno: int, exc: Exception) -> None:
+        """Transient: the transport link broke (peer restart or network
+        outage). Drop the connection's ledger WITHOUT any failed marking —
+        it is coming back — and report a link_error so the engine retires
+        the connection's in-flight requests while leaving the connection
+        recoverable (the permanent path instead isolates it)."""
+        lwd_logger.error(
+            "[LWD][pre-recv] link error connection=%s seqno=%d: %r (transient)",
+            connection,
+            seqno,
+            exc,
+        )
+        self.drop_connection_early_recv(connection)
+        done_mq = self._irecv_done_mqs.get(connection, self._irecv_done_mq)
+        if done_mq is None:
+            return
+        try:
+            done_mq.enqueue((connection, "link_error", seqno, repr(exc)))
+        except Exception:
+            lwd_logger.exception("[LWD][pre-recv] failed to report link error connection=%s", connection)
 
     def _lwd_fail_early_recv_connection(self, connection: ConnectionId, seqno: int, exc: Exception) -> None:
         """Clean one failed peer and report it through the engine error ABI."""
@@ -701,7 +740,7 @@ class LwdCloudWorker(LwdWorkerBase):
                     done_mq.enqueue(("refill_done", req_id, nonce))
                 done_mq.enqueue((key, arrived))
             except Exception as exc:
-                self._lwd_fail_early_recv_connection(connection, seqno, exc)
+                self._lwd_route_early_recv_error(connection, seqno, exc)
                 blocked.add(connection)
                 continue
             finally:

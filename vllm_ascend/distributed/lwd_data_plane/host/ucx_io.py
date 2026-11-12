@@ -52,7 +52,7 @@ from vllm.v1.lwd_comm.data_comm.ucx_channel import (
 )
 from vllm.v1.lwd_comm.data_comm.ucx_port import LwdUcxTransportPort, open_transport
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdLinkError
 
 # Blocks per channel: absorbs the early frames and provides send backpressure.
 BLOCKS_PER_CHANNEL = 4
@@ -389,7 +389,10 @@ class LwdNpuUcxChannelIo:
             event.set()
             if op.error is not None:
                 with contextlib.suppress(Exception):
-                    future._finalize(error=op.error)
+                    # Transport op errors are link-class: the consumers
+                    # classify LwdLinkError as transient (peer restart /
+                    # network outage) instead of a permanent failure.
+                    future._finalize(error=LwdLinkError(f"{self.tag} send failed: {op.error!r}"))
 
         return cb
 
@@ -424,7 +427,10 @@ class LwdNpuUcxChannelIo:
                 )
             if op.error is not None:
                 with contextlib.suppress(Exception):
-                    future._finalize(error=op.error)
+                    # Transport op errors are link-class: the consumers
+                    # classify LwdLinkError as transient (peer restart /
+                    # network outage) instead of a permanent failure.
+                    future._finalize(error=LwdLinkError(f"{tag_str} recv failed: {op.error!r}"))
                 return
             data = op.data
             try:
