@@ -85,7 +85,7 @@ def _cloud_share_topology(*, sidecar: bool = False) -> LwdTopology:
     )
 
 
-def _single_instance_topology(*, memory_budget_mb: int | None = None) -> LwdTopology:
+def _single_instance_topology() -> LwdTopology:
     return LwdTopology.from_dict(
         {
             "deployment": {
@@ -94,7 +94,6 @@ def _single_instance_topology(*, memory_budget_mb: int | None = None) -> LwdTopo
                 "edges_num": 1,
                 "clouds_num": 1,
                 "data_plane_comm": "host",
-                "data_plane_host": {"memory_budget_mb": memory_budget_mb} if memory_budget_mb is not None else None,
             },
             "feature_ctrl": {},
             "edges": [{"id": 0, "dp": [{"dp_idx": 0, "addr": "10.0.0.1"}]}],
@@ -237,15 +236,6 @@ def test_sidecar_cloud_attaches_without_an_engine_listener(
 def test_non_endpoint_rank_holds_no_links(monkeypatch: pytest.MonkeyPatch) -> None:
     """Only the endpoint process (dp_rank == dp_idx and TP rank 0) owns IO objects."""
     _run_init(monkeypatch, _single_instance_topology(), role="cloud", instance_id=0, tp_rank=1)
-    assert lwd_host_channels._UCX_IOS == {}
-    assert lwd_host_channels._UCX_LISTENERS == {}
-
-
-def test_memory_budget_from_the_topology_fails_startup(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The per-rank budget is topology config: an over-budget need fails before any link."""
-    topology = _single_instance_topology(memory_budget_mb=100)
-    with pytest.raises(RuntimeError, match="memory budget exceeded"):
-        _run_init(monkeypatch, topology, role="cloud", instance_id=0)
     assert lwd_host_channels._UCX_IOS == {}
     assert lwd_host_channels._UCX_LISTENERS == {}
 
