@@ -14,7 +14,7 @@ from collections.abc import Iterator
 from types import SimpleNamespace
 
 import pytest
-from vllm.config.lwd.topology import LwdDP, LwdDPConnection, LwdTopology
+from vllm.config.lwd.topology import LwdConnectionId, LwdDP, LwdDPConnection, LwdTopology
 
 from vllm_ascend.distributed.lwd_data_plane.host import lwd_host_channels
 from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import _link_token
@@ -38,11 +38,16 @@ class _FakeListener:
 
 
 class _FakeIo:
-    """Stands in for LwdNpuUcxChannelIo: records the handed-in config."""
+    """Stands in for LwdNpuUcxChannelIo: records the handed-in config and
+    the registered peer-restart hooks."""
 
     def __init__(self, channel: LwdChannelType, stream: object, config: LwdNpuUcxChannelIoConfig) -> None:
         self.channel = channel
         self.config = config
+        self.peer_restart_cbs: list = []
+
+    def on_peer_restart(self, cb: object) -> None:
+        self.peer_restart_cbs.append(cb)
 
     def wait_ready(self, timeout: float | None = None) -> bool:
         return True
@@ -272,6 +277,36 @@ def test_edge_share_shared_engine_owns_every_logical_edge(monkeypatch: pytest.Mo
     # Each logical edge connects out to ITS OWN cloud, not only the primary's.
     assert ios[(0, 0, 0, UP, "send")].config.host == "10.1.0.1"
     assert ios[(1, 1, 0, UP, "send")].config.host == "10.1.0.2"
+
+
+def test_peer_restart_registration_wires_resets_and_ledger(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One peer restart: every IO re-baselines its own FIFO; the cloud's UP
+    recv IO (the ledger's owner) additionally drops its connection's
+    early-recv ledger, so one restart fires the drop exactly once."""
+    from vllm_ascend.distributed.lwd_data_plane import lwd_data_plane as plane_module
+    from vllm_ascend.worker.lwd_cloud_model import lwd_cloud_worker
+
+    resets: list[tuple[object, object, str]] = []
+    ledger_drops: list[object] = []
+
+    class _FakePlane:
+        def reset_channel_seqno(self, connection, channel, op) -> None:  # noqa: ANN001
+            resets.append((connection, channel, op))
+
+    monkeypatch.setattr(plane_module, "lwd_get_data_plane", lambda: _FakePlane())
+    monkeypatch.setattr(lwd_cloud_worker, "drop_endpoint_early_recv", ledger_drops.append)
+    _run_init(monkeypatch, _cloud_share_topology(), role="cloud", instance_id=0)
+    ios = lwd_host_channels._UCX_IOS
+    assert all(len(io.peer_restart_cbs) == 1 for io in ios.values())
+    ios[(0, 0, 0, UP, "recv")].peer_restart_cbs[0]()
+    assert resets == [(LwdConnectionId(0, 0, 0), UP, "recv")]
+    assert ledger_drops == [LwdConnectionId(0, 0, 0)]
+    ios[(0, 0, 0, DOWN, "send")].peer_restart_cbs[0]()
+    assert resets == [
+        (LwdConnectionId(0, 0, 0), UP, "recv"),
+        (LwdConnectionId(0, 0, 0), DOWN, "send"),
+    ]
+    assert ledger_drops == [LwdConnectionId(0, 0, 0)]  # exactly once per restart
 
 
 def test_sidecar_cloud_attaches_without_an_engine_listener(

@@ -38,6 +38,7 @@ from typing import Any
 import torch
 from vllm.config import get_current_vllm_config
 from vllm.config.lwd.topology import (
+    LwdConnectionId,
     LwdDPConnection,
     LwdHostDataPlane,
     LwdQosDataPlane,
@@ -227,6 +228,38 @@ def _ensure_cloud_listener(conn: LwdDPConnection, addr: str, port: int) -> LwdUc
     return listener
 
 
+def _register_peer_restart(
+    io: LwdNpuUcxChannelIo,
+    connection: LwdConnectionId,
+    channel: LwdChannelType,
+    op: str,
+    *,
+    drop_early_recv: bool,
+) -> None:
+    """Wire the transport's peer-restart event (handshake session changed at
+    link adopt) to the data-plane resets. The seqno baseline reset is per
+    (connection, channel, op) FIFO; the early-recv ledger is per connection
+    and drops only via the cloud's UP recv IO, so one restart fires it once.
+
+    Embedded transport only -- in sidecar mode io.on_peer_restart no-ops
+    (the daemon protocol has no cross-process restart event) and the
+    whole-deployment-restart semantics stay.
+    """
+
+    def on_restart() -> None:
+        from vllm_ascend.distributed.lwd_data_plane.lwd_data_plane import (
+            lwd_get_data_plane,
+        )
+
+        lwd_get_data_plane().reset_channel_seqno(connection, channel, op)
+        if drop_early_recv:
+            from vllm_ascend.worker.lwd_cloud_model import lwd_cloud_worker
+
+            lwd_cloud_worker.drop_endpoint_early_recv(connection)
+
+    io.on_peer_restart(on_restart)
+
+
 def lwd_init_host_channels() -> None:
     """Create this process's UCX links from its role identity. Idempotent.
 
@@ -257,6 +290,7 @@ def lwd_init_host_channels() -> None:
     dp_rank, tp_rank = _my_dp_identity()
     up_block_mb = _resolve_up_block_mb()
     down_block_mb = _host_plane().down_buffer_size
+    submit_wait_ready_s = _host_plane().submit_wait_ready_s
     # Sidecar deployment: a dedicated transport daemon owns the listeners and
     # engines ATTACH through the ctl socket ("daemon" mode of open_transport).
     _sidecar = _host_plane().deployment == "sidecar"
@@ -314,7 +348,7 @@ def lwd_init_host_channels() -> None:
             else:
                 op = "recv" if channel is LwdChannelType.UP else "send"
                 serve = True
-            _UCX_IOS[(conn.edge_id, conn.cloud_id, conn.dp_idx, channel, op)] = LwdNpuUcxChannelIo(
+            io = LwdNpuUcxChannelIo(
                 channel,
                 torch.npu.Stream(priority=-1),
                 LwdNpuUcxChannelIoConfig(
@@ -329,8 +363,21 @@ def lwd_init_host_channels() -> None:
                     transport_mode="daemon" if _sidecar else "embedded",
                     traffic_class=qos.traffic_class,
                     sl=qos.sl,
+                    submit_wait_ready_s=submit_wait_ready_s,
                 ),
             )
+            # Peer-restart recovery (embedded): the transport's session
+            # fingerprint change re-baselines this FIFO, and the cloud's
+            # UP recv IO additionally drops its connection's early-recv
+            # ledger (the ledger's owner, so one restart fires it once).
+            _register_peer_restart(
+                io,
+                conn.connection_id,
+                channel,
+                op,
+                drop_early_recv=role == "cloud" and channel is LwdChannelType.UP and op == "recv",
+            )
+            _UCX_IOS[(conn.edge_id, conn.cloud_id, conn.dp_idx, channel, op)] = io
     # Listeners bind at construction; accept loops start only after every
     # channel has registered its token (LwdUcxListener.register rejects
     # duplicates, so registration order does not matter). Daemon mode has

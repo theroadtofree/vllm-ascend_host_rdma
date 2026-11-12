@@ -62,6 +62,21 @@ _LWD_EARLY_RECV_MAX_INFLIGHT = 2
 _LWD_HOST_STAGE_SLOTS = 2
 _LWD_SHUTDOWN_TIMEOUT_S = 5.0
 
+# The wire-layer peer-restart hook (registered at channel build time, when
+# no worker reference exists yet) reaches the endpoint worker through this
+# module singleton.
+_ENDPOINT_WORKER: LwdCloudWorker | None = None
+
+
+def drop_endpoint_early_recv(connection: ConnectionId) -> None:
+    """Hook target of the cloud's UP recv IO: drop one connection's
+    early-recv ledger after its edge restarted."""
+    worker = _ENDPOINT_WORKER
+    if worker is None:
+        lwd_logger.error("[LWD][pre-recv] early-recv drop MISS: no endpoint worker for %s", connection)
+        return
+    worker.drop_connection_early_recv(connection)
+
 
 class LwdCloudWorker(LwdWorkerBase):
     """LwdWorkerBase + LWD data-plane wiring (cloud side only).
@@ -125,6 +140,8 @@ class LwdCloudWorker(LwdWorkerBase):
         self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
         self._lwd_up_num_experts_per_tok = getattr(self.model_config.hf_config, "num_experts_per_tok", 0)
         if self._lwd_early_recv_endpoint:
+            global _ENDPOINT_WORKER
+            _ENDPOINT_WORKER = self
             self._lwd_init_lwd_host_stager()
             self._start_lwd_early_recv_thread()
         lwd_logger.info(
@@ -387,6 +404,37 @@ class LwdCloudWorker(LwdWorkerBase):
             if key[0] == connection
         ]
         return min(candidates) if candidates else -1
+
+    def drop_connection_early_recv(self, connection: ConnectionId) -> None:
+        """Peer edge restarted: drop its early-recv ledger so the new edge's
+        from-zero hints are not judged 'already delivered' by a stale
+        watermark (the silent-reject hang). Unlike the failure path, the
+        connection is coming back: no failed marking, no data-plane abort."""
+        with self._early_recv_lock:
+            futures = [future for key, future in self._early_recv_futures.items() if key[0] == connection]
+            for key in list(self._early_recv_futures):
+                if key[0] == connection:
+                    self._early_recv_futures.pop(key, None)
+            for key in list(self._early_recv_pending):
+                if key[0] == connection:
+                    self._early_recv_pending.pop(key, None)
+            for key in list(self._early_recv_reserved):
+                if key[0] == connection:
+                    self._early_recv_reserved.discard(key)
+            self._early_recv_last_delivered.pop(connection, None)
+            if self._early_recv_current_key is not None and self._early_recv_current_key[0] == connection:
+                self._early_recv_current_key = None
+        for future in futures:
+            try:
+                future.release_device_tensor()
+            except Exception:
+                lwd_logger.exception("[LWD][pre-recv] failed to release receive tensor connection=%s", connection)
+        if self._lwd_stager is not None:
+            try:
+                self._lwd_stager.abandon_connection(connection)
+            except Exception:
+                lwd_logger.exception("[LWD][pre-recv] failed to clean host staging connection=%s", connection)
+        lwd_logger.error("[LWD][pre-recv] early-recv ledger dropped connection=%s (peer restarted)", connection)
 
     def _lwd_fail_early_recv_connection(self, connection: ConnectionId, seqno: int, exc: Exception) -> None:
         """Clean one failed peer and report it through the engine error ABI."""

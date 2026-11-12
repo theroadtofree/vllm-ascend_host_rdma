@@ -87,9 +87,7 @@ class LwdTransferQueue:
         control-plane abort on both sides) — skipping a seqno the peer
         later submits is a pairing error and raises at submission."""
         with self._submission_lock:
-            if self._next_seqno is None:
-                self._next_seqno = 0
-            if seqno < self._next_seqno:
+            if seqno < (self._next_seqno or 0):
                 return  # already passed
             # A held (out-of-order) entry for an aborted seqno must never
             # be executed: discard it and fail its deferred future so any
@@ -109,6 +107,24 @@ class LwdTransferQueue:
                 held_request, held_future = self._held.pop(self._next_seqno)
                 self._execute_next(held_request, into=held_future)
                 self._next_seqno += 1
+
+    def reset_peer_baseline(self) -> None:
+        """Peer restarted (session fingerprint changed at link adopt): its
+        seqno stream continues at an unknown value, so fail the held frames
+        of the old stream and let the next arriving frame re-baseline the
+        FIFO (lazy baseline — there is no "reset to which value" to answer).
+        Posted ops of the broken link are already terminated by the
+        transport; the connection is coming back, so this is not an abort."""
+        with self._submission_lock:
+            stale, self._held = self._held, {}
+            self._skipped.clear()
+            self._next_seqno = None
+            for _request, held_future in stale.values():
+                held_future._finalize(
+                    error=RuntimeError(
+                        f"peer restarted; dropped held seqno on channel {self.channel_type.value} {self.op}"
+                    )
+                )
 
     # ------------------------------------------------------------------ #
     # Submission                                                          #
@@ -160,8 +176,11 @@ class LwdTransferQueue:
         seqno = request.seqno
         assert seqno is not None
         if self._next_seqno is None:
-            # Contract: per-channel seqno counters start at 0.
-            self._next_seqno = 0
+            # Lazy baseline: the first arriving seqno IS the baseline. The
+            # peer's counter starts at 0 only while it never restarted; a
+            # restarted peer's counter may continue against this fresh (or
+            # reset) queue, so pinning to 0 would hold every frame forever.
+            self._next_seqno = seqno
         self._advance_past_skipped()
         if seqno in self._skipped or seqno < self._next_seqno:
             # A skipped (aborted) seqno can still arrive when the peer's

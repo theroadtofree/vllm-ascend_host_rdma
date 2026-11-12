@@ -129,6 +129,33 @@ class LwdDataPlane:
                 return
         queue.skip_seqno(seqno)
 
+    def reset_channel_seqno(
+        self,
+        connection: ConnectionId,
+        channel_type: LwdChannelType,
+        op: str,
+    ) -> None:
+        """Re-baseline one FIFO after its peer restarted (the transport's
+        session fingerprint changed at link adopt). Pending skip holes
+        belong to the old stream and must not wedge the new one. The
+        connection itself is NOT failed — it is coming back, unlike
+        ``abort_connection``."""
+        key = (connection, channel_type, op)
+        with self._lock:
+            queue = self._queues.get(key)
+            self._pending_skips.pop(key, None)
+        if queue is None:
+            # Every built IO registers its own reset, so a miss is a wiring
+            # bug, not a state to retry silently.
+            logger.error(
+                "[LWD] reset_channel_seqno MISS: no %s %s queue for %s",
+                channel_type.value,
+                op,
+                connection,
+            )
+            return
+        queue.reset_peer_baseline()
+
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
     # ------------------------------------------------------------------ #
