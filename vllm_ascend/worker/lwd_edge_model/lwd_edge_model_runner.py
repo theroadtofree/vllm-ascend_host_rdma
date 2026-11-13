@@ -296,6 +296,29 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             seqno=seqno,
         )
         self._lwd_submit_up_send(request)
+        # [Lwd][up-chunk] Prefill UP transfer progress (ERROR per user
+        # request): one line per request per chunk, with the request id and
+        # the chunk ordinal within that request's prompt. prompt_offsets[i]
+        # is the chunk start inside request i's prompt; +1 makes it the
+        # human-readable "1st/2nd/... chunk". Pair with the cloud-side
+        # [Lwd][up-chunk-recv] line (same req id, same ordinal) to see each
+        # chunk's wire latency end to end.
+        for _rid, _off, _toks in zip(
+            batch_meta.req_ids, batch_meta.prompt_offsets, batch_meta.token_ids
+        ):
+            if not _toks:
+                continue
+            lwd_logger.error(
+                "[Lwd][up-chunk] UP chunk SENT req=%s chunk#=%d rows=%d "
+                "seqno=%s connection=(edge=%d, cloud=%d, dp=%d)",
+                _rid,
+                _off // max(len(_toks), 1) + 1,
+                len(_toks),
+                seqno,
+                connection.edge_id,
+                connection.cloud_id,
+                connection.dp_idx,
+            )
         # [Lwd][perf] TTFT probes: forward = the embed forward;
         # submit_send = snapshot clone + broadcast submit (including the
         # bridge's handle.wait) — if the UP world broadcast is waiting on

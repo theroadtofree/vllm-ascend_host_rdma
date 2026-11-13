@@ -694,6 +694,28 @@ class LwdCloudWorker(LwdWorkerBase):
                 published = stager.publish_received(stage_key)
                 stager.release_if_drained(stage_key)
                 arrived = [(req_id, offset + rows) for req_id, rows, offset in published]
+                # [Lwd][up-chunk-recv] Prefill UP transfer progress (ERROR
+                # per user request): one line per request per received
+                # chunk, with the request id and the chunk ordinal within
+                # that request's prompt. dest_row is the chunk's start row
+                # inside the prompt and rows its length, so the ordinal is
+                # dest_row // rows + 1 for equal-size chunks (a shorter
+                # tail chunk still lands on the right ordinal because the
+                # quotient of its start row holds). Pair with the edge-side
+                # [Lwd][up-chunk] SENT line (same req id + ordinal) to read
+                # each chunk's wire latency end to end.
+                for _rid, _rows, _dest_row in published:
+                    lwd_logger.error(
+                        "[Lwd][up-chunk-recv] UP chunk RECV'd req=%s chunk#=%d "
+                        "rows=%d seqno=%d connection=(edge=%d, cloud=%d, dp=%d)",
+                        _rid,
+                        _dest_row // _rows + 1 if _rows else -1,
+                        _rows,
+                        seqno,
+                        connection.edge_id,
+                        connection.cloud_id,
+                        connection.dp_idx,
+                    )
                 future.release_device_tensor()
                 for req_id, nonce in stager.take_refill_done(connection):
                     done_mq.enqueue(("refill_done", req_id, nonce))
