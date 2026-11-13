@@ -744,22 +744,11 @@ class LwdCloudWorker(LwdWorkerBase):
                 req_ids = payload.req_ids
                 seqno = self._lwd_next_down_seqno(connection)
                 if connection in self._lwd_early_recv_connections:
-                    # [Lwd][down-frame] DOWN send progress (ERROR per user
-                    # request): one line per engine step per connection,
-                    # with the step's request ids and the DOWN seqno. Pair
-                    # with the edge-side [Lwd][down-frame-recv] line (same
-                    # seqno) to read each DOWN frame's wire latency and to
-                    # see the cloud's DOWN cadence directly (a stretched
-                    # cadence = slow engine steps throttling decode).
-                    lwd_logger.error(
-                        "[Lwd][down-frame] DOWN frame SENT seqno=%d rows=%d "
-                        "reqs=%s connection=(edge=%d, cloud=%d, dp=%d)",
+                    lwd_logger.info(
+                        "[Lwd][cloud-worker] DOWN send connection=%s seqno=%d numel=%d",
+                        connection,
                         seqno,
-                        hidden.shape[0],
-                        list(req_ids),
-                        connection.edge_id,
-                        connection.cloud_id,
-                        connection.dp_idx,
+                        hidden.numel(),
                     )
                     lwd_get_data_plane().submit_send(
                         LwdTransferRequest(

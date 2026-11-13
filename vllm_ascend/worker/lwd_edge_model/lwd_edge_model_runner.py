@@ -418,24 +418,6 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         _remaining = max(_deadline - time.monotonic(), 0.0)
         if not recv_future.wait_device_fired(_remaining):
             return _degrade(f"DOWN completion event not fired after {_remaining:.1f}s")
-        # [Lwd][down-frame-recv] DOWN receive progress (ERROR per user
-        # request): logged when the frame's completion event has FIRED (data
-        # landed and H2D done -- the point lm_head can run). Pair with the
-        # cloud-side [Lwd][down-frame] SENT line (same seqno) to read each
-        # DOWN frame's end-to-end latency; a gap between SENT and RECV'd
-        # with both sides otherwise idle is wire/channel time, consecutive
-        # SENT lines far apart are the cloud's step cadence throttling
-        # decode.
-        lwd_logger.error(
-            "[Lwd][down-frame-recv] DOWN frame RECV'd seqno=%s rows=%d "
-            "reqs=%s connection=(edge=%d, cloud=%d, dp=%d)",
-            seqno,
-            batch_meta.recv_num_elements // max(self.model_config.get_hidden_size(), 1),
-            list(batch_meta.req_ids),
-            connection.edge_id,
-            connection.cloud_id,
-            connection.dp_idx,
-        )
         # The receive tensor was allocated on the channel stream but is
         # consumed by lm_head on the compute stream. Keep its allocation
         # alive until that stream's work completes, including after the
