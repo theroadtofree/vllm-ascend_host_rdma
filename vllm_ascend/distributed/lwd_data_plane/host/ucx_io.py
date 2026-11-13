@@ -36,9 +36,12 @@ identical on both peers and verified per link at handshake.
 from __future__ import annotations
 
 import contextlib
+import os
 import queue
+import sys
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -61,6 +64,12 @@ BLOCKS_PER_CHANNEL = 4
 # at BLOCKS_PER_CHANNEL and silently drops the oldest frame on overflow.
 _EARLY_MAX = 4096
 _HS_TIMEOUT_S = 600.0
+# Debug: staging starvation dump threshold (env-tunable, 0 disables). A send
+# block returns only when its UCX send completes (cloud posted the receive);
+# >5s starvation under load is the sender-side face of the concurrent-128k
+# stall (both clouds stuck while the edge sender sat here).
+_STAGING_POOL_DEPTH = BLOCKS_PER_CHANNEL
+_STAGING_STALL_DUMP_S = float(os.environ.get("LWD_STAGING_STALL_DUMP_S", "5.0"))
 
 
 # Reserved tag for frames without a seqno (production request streams all
@@ -292,6 +301,27 @@ class LwdNpuUcxChannelIo:
                 with contextlib.suppress(Exception):
                     future._finalize(error=exc)
 
+    def _dump_threads_staging(self, seqno: int | None, waited: float) -> None:
+        """ERROR-level full-process stack dump on staging starvation.
+
+        The starved sender thread is the *symptom*; whether the cause is
+        the cloud never posting receives, the UCX IO thread stalling, or
+        the engine loop pinning somewhere else is only visible from the
+        other threads' stacks.
+        """
+        names = {t.ident: t.name for t in threading.enumerate()}
+        lines = [
+            f"[lwd-ucx] {self.tag} staging starved seqno={seqno}: no send "
+            f"block free for {waited:.1f}s (pool depth {_STAGING_POOL_DEPTH}; "
+            f"blocks return only when the peer consumes the frame) -- if "
+            f"prolonged, the CLOUD side is not posting/advancing receives on "
+            f"this connection"
+        ]
+        for tid, frame in sys._current_frames().items():
+            lines.append(f"---- thread {names.get(tid, '?')} (tid={tid}) ----")
+            lines.extend(traceback.format_stack(frame))
+        logger.error("\n".join(lines))
+
     def _do_send(self, seqno: int | None, tensor: Any, aux_tensor: Any, future: Any) -> None:
         payload_bytes = self._nbytes(tensor)
         aux_bytes = self._nbytes(aux_tensor) if aux_tensor is not None else 0
@@ -304,7 +334,35 @@ class LwdNpuUcxChannelIo:
         # Library-pool staging block (pool depth = in-flight cap, i.e.
         # backpressure; blocks until one frees — the completion callback
         # releases it back; registration/rcache handled by the library).
-        stg = self._ch.acquire_staging()
+        # Debug stall watch: a block frees only when the UCX send completes,
+        # i.e. when the CLOUD posted its receive and consumed the frame. Under
+        # the concurrent-128k incident the edge sender sat here (queue depth
+        # 4 exhausted) while both clouds reported stuck — this watch makes
+        # that exact state visible with a full-thread stack dump. The wait
+        # itself is intentional backpressure and continues (env-tunable
+        # threshold; 0 disables the dump).
+        _acq_t0 = time.monotonic()
+        _acq_dumped = False
+        while True:
+            stg = self._ch.acquire_staging(timeout=0.5)
+            if stg is not None:
+                break
+            waited = time.monotonic() - _acq_t0
+            if not _acq_dumped and waited >= _STAGING_STALL_DUMP_S:
+                _acq_dumped = True
+                self._dump_threads_staging(seqno, waited)
+            if _acq_dumped and waited >= _STAGING_STALL_DUMP_S + 5.0 and (waited - _STAGING_STALL_DUMP_S) % 10.0 < 0.5:
+                # Progress line every ~10s while still starved: shows whether
+                # ANY block ever returns (a burst release vs a hard deadlock).
+                logger.error(
+                    "[lwd-ucx] %s staging still starved seqno=%s waited=%.1fs "
+                    "(pool depth %d; blocks return only on send completion = "
+                    "cloud receive)",
+                    self.tag,
+                    seqno,
+                    waited,
+                    _STAGING_POOL_DEPTH,
+                )
         sent = False
         try:
             tag = seqno if seqno is not None else _NO_SEQNO_TAG

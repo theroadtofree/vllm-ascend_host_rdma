@@ -10,17 +10,44 @@ keepalive.
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
 import time
+import traceback
 from typing import Any
 
 import torch
+
+from vllm.lwd_logger import lwd_logger
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
     LwdTransferRequest,
     LwdTransferResult,
     LwdTransferStatus,
 )
+
+# Debug stall watchdog: how long wait_on_current_stream may sit waiting for
+# the sender/IO thread to bind the completion event before dumping every
+# thread's stack at ERROR level. A healthy bind is milliseconds; the default
+# 5s matches the ucx_channel recv-stuck watchdog so both sides of a stall
+# fire together. 0 disables the dump (plain wait, old behaviour).
+_FUTURE_BIND_TIMEOUT_S = float(os.environ.get("LWD_FUTURE_BIND_TIMEOUT_S", "5.0"))
+
+
+def _dump_all_threads(reason: str) -> None:
+    """ERROR-level snapshot of every live thread's stack (stall forensics).
+
+    The wait's victim is usually the EngineCore main thread; the *cause*
+    lives in other threads (UCX IO, sender, comm threads), so the whole
+    process is captured, not just the waiter.
+    """
+    lines = [reason]
+    names = {t.ident: t.name for t in threading.enumerate()}
+    for tid, frame in sys._current_frames().items():
+        lines.append(f"---- thread {names.get(tid, '?')} (tid={tid}) ----")
+        lines.extend(traceback.format_stack(frame))
+    lwd_logger.error("\n".join(lines))
 
 
 class LwdTransferFuture:
@@ -207,10 +234,34 @@ class LwdTransferFuture:
         crash the consumer.  Host-side completion events (UCX sends)
         carry no device ordering semantics; ordering after them is a
         no-op (their data is host-staged, already readable when set).
+
+        Debug stall watchdog: this wait is a suspected engine-loop
+        pinning point under concurrent large prompts (one connection's
+        DOWN frame not arriving freezes the single-threaded EngineCore
+        scheduler here, and the OTHER connection's UP sends stall with
+        it — matching the 11-13 incident where both clouds reported
+        stuck within the same second). A healthy bind takes milliseconds;
+        anything past LWD_FUTURE_BIND_TIMEOUT_S dumps every thread's
+        stack at ERROR level (rate-limited per future) so the wait's
+        cause is visible, then keeps waiting (fail-fast would take the
+        engine down; the watchdog in ucx_channel owns that decision).
         """
+        deadline = time.monotonic() + _FUTURE_BIND_TIMEOUT_S
+        dumped = False
         with self._done_cond:
             while self._done_event is None and self._status is LwdTransferStatus.PENDING:
                 self._done_cond.wait(timeout=0.01)
+                if not dumped and time.monotonic() > deadline:
+                    dumped = True
+                    _dump_all_threads(
+                        f"[lwd-comm] future bind stalled: {self._request.channel.value} "
+                        f"seqno={self._request.seqno} connection=(edge={self._request.edge_id}, "
+                        f"cloud={self._request.cloud_id}, dp={self._request.dp_idx}) waited "
+                        f"{time.monotonic() - (deadline - _FUTURE_BIND_TIMEOUT_S):.1f}s "
+                        f"for the sender/IO thread to bind the completion event -- "
+                        f"if the engine main thread is here, the whole scheduler loop "
+                        f"is pinned on this single op"
+                    )
             if self._status is LwdTransferStatus.ERROR:
                 raise RuntimeError(
                     f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"

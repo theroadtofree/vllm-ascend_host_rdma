@@ -56,6 +56,15 @@ def select_token_batch(logits: torch.Tensor, ranks: list[int]) -> list[int]:
 class LwdEdgeModelRunner(LwdBaseModelRunner):
     """Embed + unembed compute for the LWD edge (no native step pipeline)."""
 
+    # Debug: single-threaded EngineCore loop occupancy watch. The loop runs
+    # both connections' EMBED/UNEMBED batches serially, so ONE slow batch
+    # (e.g. an UNEMBED whose DOWN frame never arrives) pins the loop and
+    # stalls the OTHER connection's UP sends too — the suspected mechanism
+    # behind the 11-13 incident (both clouds stuck within the same second).
+    # Each execute_* entry stamps this state; the next entry reports the
+    # previous batch's occupancy when it exceeded the threshold.
+    _LOOP_OCCUPANCY_WARN_S = 5.0
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -67,6 +76,36 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         self.tid2eid_tables: list[torch.Tensor] = []
         self._lwd_up_send_inflight: dict[ConnectionId, deque[tuple[int, LwdTransferFuture]]] = {}
         self._lwd_up_send_watermarks: dict[ConnectionId, int] = {}
+        self._lwd_loop_batch: tuple[str, ConnectionId, int, float] | None = None
+
+    def _lwd_note_loop_batch(self, kind: str, connection: ConnectionId, seqno: int) -> None:
+        """Stamp loop occupancy; shout when the previous batch held the loop too long."""
+        now = time.monotonic()
+        prev = self._lwd_loop_batch
+        self._lwd_loop_batch = (kind, connection, seqno, now)
+        if prev is None:
+            return
+        p_kind, p_conn, p_seqno, p_t0 = prev
+        held = now - p_t0
+        if held >= self._LOOP_OCCUPANCY_WARN_S:
+            lwd_logger.error(
+                "[Lwd][edge-loop] previous batch held the EngineCore loop for "
+                "%.1fs: %s connection=(edge=%d, cloud=%d, dp=%d) seqno=%s -- "
+                "every other connection's EMBED/UNEMBED (and its UP sends) "
+                "waited behind it; now entering %s seqno=%s on "
+                "connection=(edge=%d, cloud=%d, dp=%d)",
+                held,
+                p_kind,
+                p_conn.edge_id,
+                p_conn.cloud_id,
+                p_conn.dp_idx,
+                p_seqno,
+                kind,
+                seqno,
+                connection.edge_id,
+                connection.cloud_id,
+                connection.dp_idx,
+            )
 
     def load_model(self) -> None:
         """Load the edge model and read the CPU Hash routing tables for
@@ -193,6 +232,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
     ) -> ModelRunnerOutput:
         model = self.get_model()
         connection = connection_from(batch_meta)
+        self._lwd_note_loop_batch("EMBED", connection, seqno)
         if not batch_meta.token_ids:
             return self._lwd_watermarked_output(connection)
 
@@ -262,6 +302,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
     def execute_lwd_unembed(self, seqno: int, batch_meta: LwdUnembedBatch) -> ModelRunnerOutput:
         model = self.get_model()
         connection = connection_from(batch_meta)
+        self._lwd_note_loop_batch("UNEMBED", connection, seqno)
         if not batch_meta.req_ids:
             return self._lwd_watermarked_output()
 
