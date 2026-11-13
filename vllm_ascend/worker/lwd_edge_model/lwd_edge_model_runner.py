@@ -11,6 +11,7 @@ unchanged, this only restores the native worker↔runner division.
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from typing import TYPE_CHECKING
@@ -32,6 +33,14 @@ from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModel
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_mm_cache import LwdEdgeMmCache
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
 from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
+
+# Bounded DOWN wait: an unbounded wait_on_current_stream in execute_lwd_unembed
+# pins the single-threaded EngineCore loop (one batch held it 96.1s on 11-13,
+# stalling every connection). Past this timeout the batch degrades to zero
+# tokens (requests finish as ERROR via the scheduler's row disposition) and
+# the loop moves on. A healthy DOWN frame lands in milliseconds; the default
+# is generous. 0 restores the old unbounded behaviour.
+_UNEMBED_WAIT_TIMEOUT_S = float(os.environ.get("LWD_UNEMBED_WAIT_TIMEOUT_S", "60.0"))
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -306,6 +315,30 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         if not batch_meta.req_ids:
             return self._lwd_watermarked_output()
 
+        # Finish-only notifies (hidden_num_elements == 0, down_seqno == -1):
+        # the cloud closes requests without any DOWN data (connection failure
+        # cleanup, DISABLE_DOWN bypass). Submitting the recv anyway posts a
+        # tag that never arrives -- under the abort path it collides with the
+        # reorder-buffer skip hole and crashes the whole engine ("seqno -1
+        # was skipped (aborted)", observed 11-13 twice). No data means no
+        # receive, no lm_head: deliver zero tokens and let the scheduler's
+        # per-row disposition finish the requests from the notify itself.
+        if batch_meta.recv_num_elements == 0 or seqno < 0:
+            lwd_logger.warning(
+                "[Lwd][edge-worker] UNEMBED finish-only seqno=%s reqs=%s "
+                "recv_num_elements=%d: skipping DOWN receive",
+                seqno,
+                list(batch_meta.req_ids),
+                batch_meta.recv_num_elements,
+            )
+            output = self._lwd_watermarked_output()
+            output.req_ids = batch_meta.req_ids
+            output.req_id_to_index = {
+                req_id: index for index, req_id in enumerate(batch_meta.req_ids)
+            }
+            output.sampled_token_ids = [[] for _ in batch_meta.req_ids]
+            return output
+
         _t0 = time.monotonic()
         recv_future = self.worker.comm_service.submit_recv(
             LwdTransferRequest(
@@ -319,9 +352,38 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             )
         )
         _t_post = time.monotonic()
-        # wait_on_current_stream: device-ordered wait; the host never blocks
-        recv_future.wait_on_current_stream()
-        result = recv_future.result()
+        # wait_on_current_stream: device-ordered wait. Bounded: an unbounded
+        # wait here pins the SINGLE-THREADED EngineCore scheduler loop --
+        # observed 11-13: one UNEMBED held the loop for 96.1s while the other
+        # connection's UP sends (and its own) stalled behind it, and both
+        # clouds fail-fasted on stuck receives. On timeout the batch
+        # degrades instead of pinning: zero tokens are returned so the
+        # scheduler's row disposition ("error" for accepted>0 rows without
+        # tokens, "skip"/"deliver" for the rest) finishes the affected
+        # requests as ERROR while the loop moves on to the next batch.
+        try:
+            recv_future.wait_on_current_stream(timeout=_UNEMBED_WAIT_TIMEOUT_S)
+            result = recv_future.result()
+        except TimeoutError as exc:
+            lwd_logger.error(
+                "[Lwd][edge-worker] UNEMBED seqno=%s DOWN wait timed out "
+                "after %.1fs (connection=(edge=%d, cloud=%d, dp=%d) reqs=%s): "
+                "returning zero tokens -- affected requests finish as ERROR, "
+                "the engine loop continues",
+                seqno,
+                _UNEMBED_WAIT_TIMEOUT_S,
+                connection.edge_id,
+                connection.cloud_id,
+                connection.dp_idx,
+                list(batch_meta.req_ids),
+            )
+            output = self._lwd_watermarked_output()
+            output.req_ids = batch_meta.req_ids
+            output.req_id_to_index = {
+                req_id: index for index, req_id in enumerate(batch_meta.req_ids)
+            }
+            output.sampled_token_ids = [[] for _ in batch_meta.req_ids]
+            return output
         # The receive tensor was allocated on the channel stream but is
         # consumed by lm_head on the compute stream. Keep its allocation
         # alive until that stream's work completes, including after the

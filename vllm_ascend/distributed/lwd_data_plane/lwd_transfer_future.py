@@ -224,7 +224,7 @@ class LwdTransferFuture:
     # Device-side ordering for consumers                                  #
     # ------------------------------------------------------------------ #
 
-    def wait_on_current_stream(self) -> None:
+    def wait_on_current_stream(self, timeout: float | None = None) -> None:
         """Order the *current* stream after the channel-stream completion
         event (pure device-side; CPU returns immediately).
 
@@ -245,8 +245,15 @@ class LwdTransferFuture:
         stack at ERROR level (rate-limited per future) so the wait's
         cause is visible, then keeps waiting (fail-fast would take the
         engine down; the watchdog in ucx_channel owns that decision).
+
+        ``timeout`` bounds the whole wait: on expiry TimeoutError is
+        raised and the caller degrades (execute_lwd_unembed returns zero
+        tokens so the affected requests finish as ERROR while the
+        engine loop moves on). ``None`` (default) waits forever, except
+        the stall-dump watchdog above still fires.
         """
         deadline = time.monotonic() + _FUTURE_BIND_TIMEOUT_S
+        hard_deadline = None if timeout is None else time.monotonic() + timeout
         dumped = False
         with self._done_cond:
             while self._done_event is None and self._status is LwdTransferStatus.PENDING:
@@ -261,6 +268,17 @@ class LwdTransferFuture:
                         f"for the sender/IO thread to bind the completion event -- "
                         f"if the engine main thread is here, the whole scheduler loop "
                         f"is pinned on this single op"
+                    )
+                if (
+                    hard_deadline is not None
+                    and self._done_event is None
+                    and self._status is LwdTransferStatus.PENDING
+                    and time.monotonic() > hard_deadline
+                ):
+                    raise TimeoutError(
+                        f"lwd-comm wait timed out (unbound) on "
+                        f"{self._request.channel.value} seqno="
+                        f"{self._request.seqno} after {timeout:.1f}s"
                     )
             if self._status is LwdTransferStatus.ERROR:
                 raise RuntimeError(
