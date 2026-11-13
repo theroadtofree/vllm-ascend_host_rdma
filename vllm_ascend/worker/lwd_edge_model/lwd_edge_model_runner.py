@@ -41,6 +41,10 @@ from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
 # the loop moves on. A healthy DOWN frame lands in milliseconds; the default
 # is generous. 0 restores the old unbounded behaviour.
 _UNEMBED_WAIT_TIMEOUT_S = float(os.environ.get("LWD_UNEMBED_WAIT_TIMEOUT_S", "60.0"))
+# Phase-breakdown ERROR threshold for one EMBED/UNEMBED batch (ms). Healthy
+# batches are ~ms; anything past this prints which phase ate the time so the
+# next stall names its phase in the log without another probe round.
+_SLOW_BATCH_MS = float(os.environ.get("LWD_SLOW_BATCH_MS", "5000"))
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -297,6 +301,21 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         # bridge's handle.wait) — if the UP world broadcast is waiting on
         # the cloud's enqueue, this segment grows visibly (direct evidence
         # of chunk-level lockstep)
+        _embed_total_ms = (time.monotonic() - _t0) * 1000
+        if _embed_total_ms > _SLOW_BATCH_MS:
+            lwd_logger.error(
+                "[Lwd][edge-worker] EMBED slow batch: seqno=%s total=%.1fms "
+                "forward=%.2f submit_send=%.2f tokens=%d "
+                "connection=(edge=%d, cloud=%d, dp=%d)",
+                seqno,
+                _embed_total_ms,
+                (_t_fwd - _t0) * 1000,
+                (time.monotonic() - _t_fwd) * 1000,
+                len(flat_token_ids),
+                connection.edge_id,
+                connection.cloud_id,
+                connection.dp_idx,
+            )
         lwd_logger.info(
             "[Lwd][perf] embed seqno=%s forward=%.2f submit_send=%.2f total=%.2fms tokens=%d",
             seqno,
@@ -340,6 +359,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             return output
 
         _t0 = time.monotonic()
+        _deadline = _t0 + _UNEMBED_WAIT_TIMEOUT_S
         recv_future = self.worker.comm_service.submit_recv(
             LwdTransferRequest(
                 channel=LwdChannelType.DOWN,
@@ -352,38 +372,52 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             )
         )
         _t_post = time.monotonic()
+
+        def _degrade(reason: str, exc: BaseException | None = None) -> ModelRunnerOutput:
+            """Zero-token completion: the affected requests finish as ERROR
+            via the scheduler's row disposition ("error" for accepted>0 rows
+            without tokens) while the engine loop moves on -- one
+            connection's failure must never pin or kill the shared edge
+            engine."""
+            lwd_logger.error(
+                "[Lwd][edge-worker] UNEMBED seqno=%s degraded (%s): %s -- "
+                "returning zero tokens, the engine loop continues",
+                seqno,
+                reason,
+                exc or "no exception detail",
+            )
+            out = self._lwd_watermarked_output()
+            out.req_ids = batch_meta.req_ids
+            out.req_id_to_index = {
+                req_id: index for index, req_id in enumerate(batch_meta.req_ids)
+            }
+            out.sampled_token_ids = [[] for _ in batch_meta.req_ids]
+            return out
+
         # wait_on_current_stream: device-ordered wait. Bounded: an unbounded
         # wait here pins the SINGLE-THREADED EngineCore scheduler loop --
         # observed 11-13: one UNEMBED held the loop for 96.1s while the other
         # connection's UP sends (and its own) stalled behind it, and both
-        # clouds fail-fasted on stuck receives. On timeout the batch
-        # degrades instead of pinning: zero tokens are returned so the
-        # scheduler's row disposition ("error" for accepted>0 rows without
-        # tokens, "skip"/"deliver" for the rest) finishes the affected
-        # requests as ERROR while the loop moves on to the next batch.
+        # clouds fail-fasted on stuck receives.
         try:
             recv_future.wait_on_current_stream(timeout=_UNEMBED_WAIT_TIMEOUT_S)
             result = recv_future.result()
         except TimeoutError as exc:
-            lwd_logger.error(
-                "[Lwd][edge-worker] UNEMBED seqno=%s DOWN wait timed out "
-                "after %.1fs (connection=(edge=%d, cloud=%d, dp=%d) reqs=%s): "
-                "returning zero tokens -- affected requests finish as ERROR, "
-                "the engine loop continues",
-                seqno,
-                _UNEMBED_WAIT_TIMEOUT_S,
-                connection.edge_id,
-                connection.cloud_id,
-                connection.dp_idx,
-                list(batch_meta.req_ids),
-            )
-            output = self._lwd_watermarked_output()
-            output.req_ids = batch_meta.req_ids
-            output.req_id_to_index = {
-                req_id: index for index, req_id in enumerate(batch_meta.req_ids)
-            }
-            output.sampled_token_ids = [[] for _ in batch_meta.req_ids]
-            return output
+            return _degrade("DOWN bind wait timed out", exc)
+        except RuntimeError as exc:
+            # Channel broke / the op failed mid-flight: degrade this batch
+            # instead of killing the shared engine (the other connection's
+            # requests keep running; the failed ones finish as ERROR).
+            return _degrade("DOWN op failed", exc)
+        # Device gate: bind only means the frame ARRIVED and the H2D was
+        # ENQUEUED. The completion event may still never fire (channel-stream
+        # stall), and every later host sync (lm_head -> sort -> .tolist())
+        # would block on it with no bound -- the 74.8s pin observed 11-13
+        # 21:20 sat exactly here (no bind-stall, no bind-timeout fired).
+        # Poll until the event actually fires or the budget runs out.
+        _remaining = max(_deadline - time.monotonic(), 0.0)
+        if not recv_future.wait_device_fired(_remaining):
+            return _degrade(f"DOWN completion event not fired after {_remaining:.1f}s")
         # The receive tensor was allocated on the channel stream but is
         # consumed by lm_head on the compute stream. Keep its allocation
         # alive until that stream's work completes, including after the
@@ -424,6 +458,27 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             sampled_token_ids.append(flat_ids[off : off + accept])
             off += len(ranks)
         _t_sel = time.monotonic()
+        # Phase breakdown at ERROR when the batch is slow: names WHICH phase
+        # ate the time (post_recv=submit, wait_tensor=bind+device gate,
+        # lm_head=vocab forward, select=argsort+D2H sync) so the next
+        # occurrence is pinpointed without another probe round. The loop-held
+        # probe only reports totals; this splits them.
+        if (_t_sel - _t0) * 1000 > _SLOW_BATCH_MS:
+            lwd_logger.error(
+                "[Lwd][edge-worker] UNEMBED slow batch: seqno=%s total=%.1fms "
+                "post_recv=%.2f wait_tensor=%.2f lm_head=%.2f select=%.2f "
+                "reqs=%d connection=(edge=%d, cloud=%d, dp=%d)",
+                seqno,
+                (_t_sel - _t0) * 1000,
+                (_t_post - _t0) * 1000,
+                (_t_tensor - _t_post) * 1000,
+                (_t_lm - _t_tensor) * 1000,
+                (_t_sel - _t_lm) * 1000,
+                len(batch_meta.req_ids),
+                connection.edge_id,
+                connection.cloud_id,
+                connection.dp_idx,
+            )
         # [Lwd][perf] Temporary probes attributing single-request latency:
         # post_recv = posting the irecv; wait_tensor = waiting for the
         # tensor to land (network); lm_head = the vocabulary forward

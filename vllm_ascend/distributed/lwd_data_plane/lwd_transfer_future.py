@@ -288,6 +288,40 @@ class LwdTransferFuture:
         if event is not None and not getattr(event, "is_host_event", False):
             torch.npu.current_stream().wait_event(event)
 
+    def wait_device_fired(self, timeout: float) -> bool:
+        """Bounded poll until the bound completion event has FIRED on the
+        device.
+
+        ``wait_on_current_stream`` returns as soon as the future is BOUND
+        (frame arrived, H2D *enqueued*) -- the event may still be pending on
+        the channel stream, and any later host sync (lm_head -> sort ->
+        ``.tolist()``) then blocks on it with NO bound. Observed 11-13
+        21:20: an UNEMBED batch pinned the engine loop for 74.8s with
+        neither the bind watchdog nor the bind timeout firing -- the block
+        sat in exactly that post-bind device chain. Polling here converts
+        the unbounded wait into a bounded one.
+
+        True = event fired (or the future already left PENDING); False =
+        still not fired after ``timeout`` seconds -- the caller degrades.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._lock:
+                status = self._status
+                event = self._done_event
+            if status is not LwdTransferStatus.PENDING:
+                return True
+            if event is None:
+                return False
+            try:
+                if event.query():
+                    return True
+            except Exception:  # device error surfaces as not-fired
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #
     # ------------------------------------------------------------------ #
