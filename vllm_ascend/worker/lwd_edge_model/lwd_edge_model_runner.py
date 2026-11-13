@@ -296,29 +296,6 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             seqno=seqno,
         )
         self._lwd_submit_up_send(request)
-        # [Lwd][up-chunk] Prefill UP transfer progress (ERROR per user
-        # request): one line per request per chunk, with the request id and
-        # the chunk ordinal within that request's prompt. prompt_offsets[i]
-        # is the chunk start inside request i's prompt; +1 makes it the
-        # human-readable "1st/2nd/... chunk". Pair with the cloud-side
-        # [Lwd][up-chunk-recv] line (same req id, same ordinal) to see each
-        # chunk's wire latency end to end.
-        for _rid, _off, _toks in zip(
-            batch_meta.req_ids, batch_meta.prompt_offsets, batch_meta.token_ids
-        ):
-            if not _toks:
-                continue
-            lwd_logger.error(
-                "[Lwd][up-chunk] UP chunk SENT req=%s chunk#=%d rows=%d "
-                "seqno=%s connection=(edge=%d, cloud=%d, dp=%d)",
-                _rid,
-                _off // max(len(_toks), 1) + 1,
-                len(_toks),
-                seqno,
-                connection.edge_id,
-                connection.cloud_id,
-                connection.dp_idx,
-            )
         # [Lwd][perf] TTFT probes: forward = the embed forward;
         # submit_send = snapshot clone + broadcast submit (including the
         # bridge's handle.wait) — if the UP world broadcast is waiting on
@@ -441,6 +418,24 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         _remaining = max(_deadline - time.monotonic(), 0.0)
         if not recv_future.wait_device_fired(_remaining):
             return _degrade(f"DOWN completion event not fired after {_remaining:.1f}s")
+        # [Lwd][down-frame-recv] DOWN receive progress (ERROR per user
+        # request): logged when the frame's completion event has FIRED (data
+        # landed and H2D done -- the point lm_head can run). Pair with the
+        # cloud-side [Lwd][down-frame] SENT line (same seqno) to read each
+        # DOWN frame's end-to-end latency; a gap between SENT and RECV'd
+        # with both sides otherwise idle is wire/channel time, consecutive
+        # SENT lines far apart are the cloud's step cadence throttling
+        # decode.
+        lwd_logger.error(
+            "[Lwd][down-frame-recv] DOWN frame RECV'd seqno=%s rows=%d "
+            "reqs=%s connection=(edge=%d, cloud=%d, dp=%d)",
+            seqno,
+            batch_meta.recv_num_elements // max(self.model_config.get_hidden_size(), 1),
+            list(batch_meta.req_ids),
+            connection.edge_id,
+            connection.cloud_id,
+            connection.dp_idx,
+        )
         # The receive tensor was allocated on the channel stream but is
         # consumed by lm_head on the compute stream. Keep its allocation
         # alive until that stream's work completes, including after the
