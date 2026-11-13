@@ -758,12 +758,18 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         embed_numel = sum(window.rows for window in plan) * hidden_size
         stream = self._lwd_h2d_stream()
         used_event = self._lwd_win_used_ev[win_idx]
+        # Debug: per-request sync-copy cost. _lwd_h2d_copy_verified does a
+        # blocking copy_ + stream sync + 16-element read-back per request per
+        # window -- under concurrent 128k prefill this multiplies into engine
+        # step time. Anything >1s for one window is a throughput red flag.
+        per_req_ms: list[float] = []
         with torch.npu.stream(stream):
             if used_event is not None:
                 stream.wait_event(used_event)
             embed_offset = 0
             tail_offset = embed_numel
             for window in plan:
+                _req_t0 = time.monotonic()
                 self._lwd_stage_one_request(stager, window, dev, embed_offset, hidden_size)
                 embed_offset += window.rows * hidden_size
                 if tail_per_row:
@@ -780,16 +786,28 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                         strict=False,
                     )
                     tail_offset += numel
+                per_req_ms.append((time.monotonic() - _req_t0) * 1000)
             ready_event = torch.npu.Event()
             ready_event.record(stream)
         torch.npu.current_stream().wait_event(ready_event)
         for window in plan:
             stager.consume(window.req_id, window.rows)
+        _stage_ms = (time.monotonic() - started) * 1000
+        if _stage_ms > 1000.0:
+            lwd_logger.error(
+                "[Lwd][cloud-runner] window staging slow: stage=%.1fms rows=%d "
+                "reqs=%d per_req_ms=%s (sync H2D + verified read-back per "
+                "request) -- the engine thread is stalled in staging",
+                _stage_ms,
+                sum(window.rows for window in plan),
+                len(plan),
+                [f"{w.req_id}:{ms:.0f}" for w, ms in zip(plan, per_req_ms)],
+            )
         lwd_logger.info(
             "[Lwd][cloud-runner] CONSUME rows=%d reqs=%d stage=%.2fms",
             sum(window.rows for window in plan),
             len(plan),
-            (time.monotonic() - started) * 1000,
+            _stage_ms,
         )
 
     def _lwd_h2d_copy_verified(

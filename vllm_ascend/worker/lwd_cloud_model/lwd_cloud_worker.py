@@ -543,9 +543,45 @@ class LwdCloudWorker(LwdWorkerBase):
         while True:
             with self._early_recv_lock:
                 if len(self._early_recv_futures) + len(self._early_recv_reserved) >= self._early_recv_max_inflight:
+                    # Debug: the global inflight cap (shared across ALL
+                    # connections) is the #1 suspect of the concurrent-128k
+                    # throughput collapse -- with 2 edges live, each wire gets
+                    # depth 1. Shout when hints are queued behind the cap so
+                    # the "starved while capacity exists elsewhere" case is
+                    # visible in ERROR logs without waiting for the UCX
+                    # watchdog to fire on the peer side.
+                    if self._early_recv_pending:
+                        per_conn_inflight: dict[ConnectionId, int] = {}
+                        for conn, _ch, _sn in (*self._early_recv_futures, *self._early_recv_reserved):
+                            per_conn_inflight[conn] = per_conn_inflight.get(conn, 0) + 1
+                        pending_conns = sorted({key[0] for key in self._early_recv_pending})
+                        inflight_conns = sorted(per_conn_inflight)
+                        lwd_logger.error(
+                            "[Lwd][pre-recv] pump capacity full: inflight=%d/%d "
+                            "pending_hints=%d (per-connection inflight: %s; pending "
+                            "from: %s) -- other connections' receives are starved "
+                            "behind the global cap",
+                            len(self._early_recv_futures) + len(self._early_recv_reserved),
+                            self._early_recv_max_inflight,
+                            len(self._early_recv_pending),
+                            {str(c): n for c, n in per_conn_inflight.items()},
+                            [str(c) for c in pending_conns if per_conn_inflight.get(c, 0) == 0 or c in inflight_conns],
+                        )
                     return
                 picked = self._pick_pending_locked(blocked)
                 if picked is None:
+                    if blocked and self._early_recv_pending:
+                        # Debug: capacity exists but every connection with a
+                        # queued hint failed its submit (slot busy / error) --
+                        # the stager, not the cap, is the blocker.
+                        lwd_logger.error(
+                            "[Lwd][pre-recv] pump blocked without capacity use: "
+                            "blocked=%s pending_hints=%d inflight=%d/%d",
+                            [str(c) for c in sorted(blocked)],
+                            len(self._early_recv_pending),
+                            len(self._early_recv_futures) + len(self._early_recv_reserved),
+                            self._early_recv_max_inflight,
+                        )
                     return
                 key, hint = picked
                 fields = hint_fields(hint)
