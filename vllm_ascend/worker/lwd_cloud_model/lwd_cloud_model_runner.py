@@ -120,6 +120,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self.lwd_hash_state = None
         # None marks "no real batch staged yet"; distinguishes dummy forwards.
         self._lwd_hash_step_tokens = None
+        # Requests whose first UP window already went through the verified
+        # (sync) H2D path; later windows copy async (see _lwd_h2d_copy_verified).
+        self._lwd_first_window_done: set[str] = set()
         config = self.model_config.hf_config
         num_hash_layers = hash_layer_count(config)
         if num_hash_layers and vllm_config.lwd_config is not None:
@@ -655,6 +658,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         req_id_to_index = self.input_batch.req_id_to_index
         for req_id in finished_req_ids:
             self._lwd_request_connections.pop(req_id, None)
+            self._lwd_first_window_done.discard(req_id)
             if self.lwd_hash_state is not None:
                 self.lwd_hash_state.discard(req_id)
             idx = req_id_to_index.get(req_id)
@@ -799,7 +803,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     def _lwd_h2d_copy_verified(
         self, dst: torch.Tensor, src: torch.Tensor, rid: str, strict: bool = True
     ) -> None:
-        """Pinned-to-device-window H2D copy (sync + read-back check + one retry).
+        """Pinned-to-device-window H2D copy; verified sync only for a
+        request's FIRST window, plain async afterwards.
 
         Root-cause fix for the 2E2C cold-start first window (2026-11, ported
         from cr_mi_to_23.0_azy_1029_memc b471c205b): right after a segmented
@@ -808,29 +813,33 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         torch_npu (first-read transient) — the source was verified non-zero,
         the window memory is writable, and an immediate same-parameter retry
         recovers bit-for-bit. A lost first copy hands the model all-zero
-        embeddings, degrading the output to an unconditional continuation
-        from BOS ("answers an unrelated question"): only the first few
-        requests after startup, only on non-group-leader endpoint ranks,
-        self-heals afterwards, no error anywhere.
+        embeddings ("answers an unrelated question"): only the first
+        window(s) after a request's data starts arriving, self-heals after.
 
-        The check sums the first 16 destination elements: real embedding rows
-        are never all-zero (first row measured 0.12/-0.03/...), so legitimate
-        input cannot trip it. ``strict=False`` is for the expert-ID tail
-        (bytes may legitimately be zero): retry only, never fail; the retry
-        is idempotent. In steady state D2H finished long ago, the first read
-        passes and the retry branch never fires; the standing cost is one
-        blocking copy plus one 16-element read-back on the H2D stream.
+        The first-window path keeps the original sync copy + 16-element
+        read-back + retry. Later windows of the same request take the async
+        path: the 11-14 profile showed the per-request SYNC copy (blocking
+        ``copy_`` + stream synchronize + read-back, i.e. a full drain of the
+        H2D stream per request per window) was the dominant per-step cost
+        during 128k prefill drain — stage time climbed 3.9ms → 741ms per
+        window as each synchronize queued behind the previous window's
+        work. The async path enqueues the copy and lets the window-level
+        ``ready_event`` ordering (already recorded after all segments)
+        carry correctness to the compute stream; ``_lwd_first_window_done``
+        gates the verified path to once per request.
 
-        Sync scope: the read-back only needs the *issuing* stream drained,
-        which the blocking ``copy_`` already guarantees, so a stream-level
-        synchronize suffices. Cross-stream visibility towards the compute
-        stream is owned by the ``ready_event`` bridge recorded after the
-        window is staged. A device-wide ``torch.npu.synchronize()`` would
-        additionally park the engine thread behind every unrelated
-        in-flight stream (previous window's forward tail, DOWN sends,
-        early-recv HCCL ops) at each staging point with no correctness
-        gain, and is deliberately avoided here.
+        Sync scope (first window only): the read-back needs the issuing
+        stream drained, which the blocking ``copy_`` already guarantees.
+        Cross-stream visibility towards the compute stream is owned by the
+        ``ready_event`` bridge recorded after the window is staged.
         """
+        if rid in self._lwd_first_window_done:
+            # Not this request's first window: async copy, no sync, no
+            # read-back. The window-level ready_event ordering below is
+            # the correctness bridge to the compute stream.
+            dst.copy_(src, non_blocking=True)
+            return
+        self._lwd_first_window_done.add(rid)
         dst.copy_(src, non_blocking=False)
         torch.npu.current_stream().synchronize()
         if float(dst[:16].float().sum().item()) != 0.0:
