@@ -785,7 +785,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         torch.npu.current_stream().wait_event(ready_event)
         for window in plan:
             stager.consume(window.req_id, window.rows)
-        lwd_logger.info(
+        # ERROR-level: [Lwd][step-split] pinned the engine's slow phase
+        # inside native_step; this stage time (sync H2D + verified
+        # read-back per request) vs cloud-exec's forward total splits the
+        # worker time between input staging and compute.
+        lwd_logger.error(
             "[Lwd][cloud-runner] CONSUME rows=%d reqs=%d stage=%.2fms",
             sum(window.rows for window in plan),
             len(plan),

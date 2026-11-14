@@ -213,8 +213,12 @@ class LwdCloudWorker(LwdWorkerBase):
         output = super().execute_model(scheduler_output)
         # [Lwd][perf] Per-step exec_model timing on the cloud: total = the
         # whole forward pass (sample/collect are itemized separately in
-        # sample_tokens)
-        lwd_logger.info(
+        # sample_tokens). ERROR-level: [Lwd][step-split] pinned the engine's
+        # native_step (future.result wait) at 1.1-1.9s/step; pairing this
+        # with CONSUME's stage time splits that between worker forward and
+        # the UP window H2D staging, so the two lines the split needs are
+        # kept at ERROR.
+        lwd_logger.error(
             "[Lwd][perf] cloud-exec total=%.2fms",
             (time.monotonic() - _t0) * 1000,
         )
