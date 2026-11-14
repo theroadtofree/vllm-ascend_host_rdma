@@ -45,6 +45,11 @@ _UNEMBED_WAIT_TIMEOUT_S = float(os.environ.get("LWD_UNEMBED_WAIT_TIMEOUT_S", "60
 # batches are ~ms; anything past this prints which phase ate the time so the
 # next stall names its phase in the log without another probe round.
 _SLOW_BATCH_MS = float(os.environ.get("LWD_SLOW_BATCH_MS", "5000"))
+# DOWN receive cadence watchdog threshold (s): consecutive UNEMBEDs on one
+# connection farther apart than this log an ERROR (no DOWN frame reached the
+# edge in between -- pair with the cloud-side [Lwd][down-gap] line to tell
+# producer stall from wire stall). Healthy decode is ms-scale; 0 disables.
+_LWD_DOWN_GAP_WARN_S = float(os.environ.get("LWD_DOWN_GAP_WARN_S", "5.0"))
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -89,6 +94,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         self.tid2eid_tables: list[torch.Tensor] = []
         self._lwd_up_send_inflight: dict[ConnectionId, deque[tuple[int, LwdTransferFuture]]] = {}
         self._lwd_up_send_watermarks: dict[ConnectionId, int] = {}
+        # DOWN receive cadence watchdog: last UNEMBED arrival per connection
+        # (see execute_lwd_unembed; gap past _LWD_DOWN_GAP_WARN_S logs an ERROR).
+        self._lwd_unembed_last_arrival: dict[ConnectionId, float] = {}
         self._lwd_loop_batch: tuple[str, ConnectionId, int, float] | None = None
 
     def _lwd_note_loop_batch(self, kind: str, connection: ConnectionId, seqno: int) -> None:
@@ -331,6 +339,27 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         model = self.get_model()
         connection = connection_from(batch_meta)
         self._lwd_note_loop_batch("UNEMBED", connection, seqno)
+        # DOWN receive cadence watchdog: decode steps arrive near-
+        # continuously on a healthy connection. A gap past the threshold
+        # before this UNEMBED means the cloud sent nothing in between --
+        # either its engine loop stalled between steps or the frames are
+        # stuck on the wire; pair with the cloud-side [Lwd][down-gap] line
+        # (same connection) to tell producer stall from wire stall. Only
+        # oversize gaps log; normal decode stays silent.
+        _now = time.monotonic()
+        _prev = self._lwd_unembed_last_arrival.get(connection)
+        self._lwd_unembed_last_arrival[connection] = _now
+        if _prev is not None and _now - _prev >= _LWD_DOWN_GAP_WARN_S:
+            lwd_logger.error(
+                "[Lwd][down-gap-recv] DOWN receive gap %.1fs on connection="
+                "(edge=%d, cloud=%d, dp=%d) before seqno=%s -- no DOWN frame "
+                "reached the edge in between",
+                _now - _prev,
+                connection.edge_id,
+                connection.cloud_id,
+                connection.dp_idx,
+                seqno,
+            )
         if not batch_meta.req_ids:
             return self._lwd_watermarked_output()
 

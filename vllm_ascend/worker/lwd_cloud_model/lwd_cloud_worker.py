@@ -15,6 +15,7 @@ Selected via ``parallel_config.worker_cls`` (see platform.py:
 from __future__ import annotations
 
 import contextlib
+import os
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -61,6 +62,11 @@ _LWD_EARLY_RECV_LOOP_SLEEP_S = 0.002
 _LWD_EARLY_RECV_MAX_INFLIGHT = 2
 _LWD_HOST_STAGE_SLOTS = 2
 _LWD_SHUTDOWN_TIMEOUT_S = 5.0
+# DOWN cadence watchdog threshold (s): consecutive DOWN sends on one
+# connection farther apart than this log an ERROR (the engine loop produced
+# no step in between -- the edge's decode is throttled by this cadence).
+# Healthy decode steps are ms-scale; 5s only fires on real stalls. 0 disables.
+_LWD_DOWN_GAP_WARN_S = float(os.environ.get("LWD_DOWN_GAP_WARN_S", "5.0"))
 
 
 class LwdCloudWorker(LwdWorkerBase):
@@ -72,6 +78,9 @@ class LwdCloudWorker(LwdWorkerBase):
     def init_device(self) -> None:
         super().init_device()
         self._lwd_down_next_seqno: dict[ConnectionId, int] = {}
+        # DOWN cadence watchdog: last DOWN send timestamp per connection
+        # (see sample_tokens; gap past _LWD_DOWN_GAP_WARN_S logs an ERROR).
+        self._lwd_down_last_send: dict[ConnectionId, float] = {}
         self._init_lwd_early_recv_state()
         if self.use_v2_model_runner:
             raise RuntimeError("LWD data plane requires the V1 model runner; use_v2_model_runner is not supported")
@@ -567,7 +576,16 @@ class LwdCloudWorker(LwdWorkerBase):
                             # the cap. A single active connection at 2/2 is
                             # just the cap doing its job (burst backpressure).
                             starved = [c for c in pending_conns if per_conn_inflight.get(c, 0) == 0]
-                            lwd_logger.error(
+                            # WARN-level observe-only: this is the UP receive
+                            # side's expected burst backpressure (single
+                            # connection filling the global inflight cap);
+                            # UP transfers were verified healthy in the
+                            # 11-13 block-level audit, so it is not part of
+                            # the DOWN-stall investigation. Only the true
+                            # cross-connection starvation form would matter
+                            # (multi-edge: one queued connection holds 0
+                            # slots) -- kept visible, downgraded from ERROR.
+                            lwd_logger.warning(
                                 "[Lwd][pre-recv] pump capacity full: inflight=%d/%d "
                                 "pending_hints=%d (per-connection inflight: %s; pending "
                                 "from: %s)%s",
@@ -589,10 +607,13 @@ class LwdCloudWorker(LwdWorkerBase):
                         _now = time.monotonic()
                         if _now - self._early_recv_pump_blocked_last_log >= 1.0:
                             self._early_recv_pump_blocked_last_log = _now
-                            # Debug: capacity exists but every connection with a
-                            # queued hint failed its submit (slot busy / error) --
-                            # the stager, not the cap, is the blocker.
-                            lwd_logger.error(
+                            # WARN-level observe-only: capacity exists but
+                            # every connection with a queued hint failed its
+                            # submit (slot busy / error) -- the stager, not
+                            # the cap, is the blocker. UP-side diagnostic
+                            # (same family as the pump-capacity line above),
+                            # not part of the DOWN-stall investigation.
+                            lwd_logger.warning(
                                 "[Lwd][pre-recv] pump blocked without capacity use: "
                                 "blocked=%s pending_hints=%d inflight=%d/%d",
                                 [str(c) for c in sorted(blocked)],
@@ -744,12 +765,29 @@ class LwdCloudWorker(LwdWorkerBase):
                 req_ids = payload.req_ids
                 seqno = self._lwd_next_down_seqno(connection)
                 if connection in self._lwd_early_recv_connections:
-                    lwd_logger.info(
-                        "[Lwd][cloud-worker] DOWN send connection=%s seqno=%d numel=%d",
-                        connection,
-                        seqno,
-                        hidden.numel(),
-                    )
+                    # DOWN cadence watchdog: decode steps a healthy engine
+                    # every few-to-tens of ms, so consecutive DOWN sends on
+                    # one connection should be near-continuous. A gap past
+                    # the threshold means the engine loop stalled BETWEEN
+                    # steps (scheduling / prefill drain / step-head polling)
+                    # and the edge is starving on DOWN frames -- the exact
+                    # throttle suspected in the 11-13 stalls. Only the
+                    # oversize gap is logged; normal decode stays silent.
+                    _now = time.monotonic()
+                    _prev = self._lwd_down_last_send.get(connection)
+                    self._lwd_down_last_send[connection] = _now
+                    if _prev is not None and _now - _prev >= _LWD_DOWN_GAP_WARN_S:
+                        lwd_logger.error(
+                            "[Lwd][down-gap] DOWN send gap %.1fs on connection="
+                            "(edge=%d, cloud=%d, dp=%d) before seqno=%d -- the "
+                            "engine loop produced no DOWN frame in between "
+                            "(edge decode waits on this cadence)",
+                            _now - _prev,
+                            connection.edge_id,
+                            connection.cloud_id,
+                            connection.dp_idx,
+                            seqno,
+                        )
                     lwd_get_data_plane().submit_send(
                         LwdTransferRequest(
                             channel=LwdChannelType.DOWN,
