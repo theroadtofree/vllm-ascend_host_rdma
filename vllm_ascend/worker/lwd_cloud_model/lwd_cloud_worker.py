@@ -67,6 +67,10 @@ _LWD_SHUTDOWN_TIMEOUT_S = 5.0
 # no step in between -- the edge's decode is throttled by this cadence).
 # Healthy decode steps are ms-scale; 5s only fires on real stalls. 0 disables.
 _LWD_DOWN_GAP_WARN_S = float(os.environ.get("LWD_DOWN_GAP_WARN_S", "5.0"))
+# cloud-exec per-step log threshold (ms): steps past this print the
+# [Lwd][perf] cloud-exec ERROR (decode steady state ~20ms stays silent);
+# env-tunable. 0 logs every step (old behaviour).
+_LWD_SLOW_EXEC_LOG_MS = float(os.environ.get("LWD_SLOW_EXEC_LOG_MS", "1000"))
 
 
 class LwdCloudWorker(LwdWorkerBase):
@@ -213,15 +217,16 @@ class LwdCloudWorker(LwdWorkerBase):
         output = super().execute_model(scheduler_output)
         # [Lwd][perf] Per-step exec_model timing on the cloud: total = the
         # whole forward pass (sample/collect are itemized separately in
-        # sample_tokens). ERROR-level: [Lwd][step-split] pinned the engine's
-        # native_step (future.result wait) at 1.1-1.9s/step; pairing this
-        # with CONSUME's stage time splits that between worker forward and
-        # the UP window H2D staging, so the two lines the split needs are
-        # kept at ERROR.
-        lwd_logger.error(
-            "[Lwd][perf] cloud-exec total=%.2fms",
-            (time.monotonic() - _t0) * 1000,
-        )
+        # sample_tokens). Printed ONLY past 1000ms -- decode steady state
+        # (~20ms) stays silent and the slow 128k-prefill steps, the ones
+        # [Lwd][step-split] attributes native_step to, are the only ones
+        # that need pairing with CONSUME's stage time.
+        _exec_ms = (time.monotonic() - _t0) * 1000
+        if _exec_ms >= _LWD_SLOW_EXEC_LOG_MS:
+            lwd_logger.error(
+                "[Lwd][perf] cloud-exec total=%.2fms",
+                _exec_ms,
+            )
         return output
 
     def _lwd_up_post_recvs(self, scheduler_output: SchedulerOutput) -> None:
