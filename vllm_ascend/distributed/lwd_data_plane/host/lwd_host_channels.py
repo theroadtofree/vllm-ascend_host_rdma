@@ -55,6 +55,16 @@ from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import (
 )
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
+# Elastic partial start (cloud side): once the FIRST host link is up, the
+# remaining planned links share this straggler grace, then the edge
+# proceeds with the connected subset (the yaml may plan more clouds than
+# are launched). The first-link window stays long -- a co-started cloud
+# binds its listener only partway into its own init. A missing link's
+# supervision thread keeps reconnecting and the link is adopted whenever
+# the cloud starts; zero links still fails fast.
+_STRAGGLER_GRACE_S = 60.0
+_STRAGGLER_POLL_S = 0.1
+
 # (edge_id, cloud_id, dp_idx, channel, op) -> LwdNpuUcxChannelIo
 _UCX_IOS: dict[tuple[int, int, int, LwdChannelType, str], LwdNpuUcxChannelIo] = {}
 # (cloud_id, dp_idx) -> the cloud DP's shared listener (handshake entry only;
@@ -458,10 +468,17 @@ def _io(edge_id: int, cloud_id: int, dp_idx: int, channel: LwdChannelType, op: s
 
 
 def lwd_warm_up_host_channels(timeout: float | None = None) -> None:
-    """Wait for every LOCAL link's readiness -- no cross-world barrier
-    exists to join in host comm (old-branch semantics: the cloud reports
-    its listener bound and adopts edges asynchronously; the edge waits
-    for every cloud link, bounded by HS_TIMEOUT_S + 5)."""
+    """Wait for the LOCAL links' readiness -- no cross-world barrier
+    exists in host comm (old-branch semantics: the cloud reports its
+    listener bound and adopts edges asynchronously).
+
+    Elastic partial start: the FIRST link gets the long window (a
+    slow-starting cloud is still binding its listener); the remaining
+    links then share a short straggler grace, and the edge proceeds with
+    the connected subset -- the yaml may plan more clouds than are
+    launched. A missing link's supervision thread keeps reconnecting, so
+    the link comes up whenever its cloud starts. Zero links within the
+    window is a deployment error and still fails fast."""
     if timeout is None:
         from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import (
             _HS_TIMEOUT_S,
@@ -474,16 +491,48 @@ def lwd_warm_up_host_channels(timeout: float | None = None) -> None:
     import time as _time
 
     t0 = _time.perf_counter()
-    for (edge_id, cloud_id, dp_idx, channel, op), io in _UCX_IOS.items():
-        if not io.wait_ready(timeout=timeout):
-            raise RuntimeError(
-                f"[LWD][handshake] host link not ready: "
-                f"edge={edge_id} cloud={cloud_id} dp_idx={dp_idx} "
-                f"channel={channel.value} op={op} within {timeout:.0f}s"
-            )
+    # Phase A: the first link within the long window.
+    first_deadline = t0 + timeout
+    ready = False
+    while _time.perf_counter() < first_deadline:
+        if any(io.wait_ready(timeout=0) for io in _UCX_IOS.values()):
+            ready = True
+            break
+        _time.sleep(_STRAGGLER_POLL_S)
+    if not ready:
+        missing = "; ".join(
+            f"edge={e} cloud={c} dp_idx={d} channel={ch.value} op={op}"
+            for e, c, d, ch, op in _UCX_IOS
+        )
+        raise RuntimeError(
+            f"[LWD][handshake] no host link became ready within "
+            f"{timeout:.0f}s: {missing}"
+        )
+    # Phase B: the remaining links share the straggler grace (the first
+    # missing link consumes it; the rest time out immediately after).
+    grace_deadline = _time.perf_counter() + _STRAGGLER_GRACE_S
+    not_ready = [
+        (edge_id, cloud_id, dp_idx, channel, op)
+        for (edge_id, cloud_id, dp_idx, channel, op), io in _UCX_IOS.items()
+        if not io.wait_ready(timeout=max(0.0, grace_deadline - _time.perf_counter()))
+    ]
+    if not_ready:
+        logger.warning(
+            "[LWD][handshake] proceeding with %d of %d host links (elastic "
+            "partial start); missing %s will serve once the cloud starts "
+            "-- supervision threads keep reconnecting",
+            len(_UCX_IOS) - len(not_ready),
+            len(_UCX_IOS),
+            "; ".join(
+                f"edge={e} cloud={c} dp={d}/{ch.value}/{op}"
+                for e, c, d, ch, op in not_ready
+            ),
+        )
     logger.info(
-        "[LWD][handshake] OK data_plane=host links=%d %.1fms (edge-side wait_ready only, no cross-world barrier)",
+        "[LWD][handshake] OK data_plane=host links=%d ready=%d %.1fms "
+        "(edge-side wait_ready only, elastic partial start)",
         len(_UCX_IOS),
+        len(_UCX_IOS) - len(not_ready),
         (_time.perf_counter() - t0) * 1000.0,
     )
 
