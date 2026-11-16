@@ -63,13 +63,17 @@ _LWD_EARLY_RECV_DEQUEUE_TIMEOUT_S = 0.0005
 _LWD_EARLY_RECV_ERROR_SLEEP_S = 0.01
 _LWD_EARLY_RECV_LOOP_SLEEP_S = 0.002
 # Posted-but-unconsumed early UP receives (cloud endpoint), env-tunable via
-# LWD_ASCEND_LWD_MAX_INFLIGHT_RECV. The performance-proven sidecar branch
-# runs 8 (an in-flight entry is pipeline bookkeeping, not an NPU-memory
-# bound, and depth should be >= the edge's pending-chunks gate). Default
-# stays at the historical 2 pending a clean perf validation of the wider
-# pipeline; set the env to 8 to test.
-_LWD_EARLY_RECV_MAX_INFLIGHT = int(os.environ.get("LWD_ASCEND_LWD_MAX_INFLIGHT_RECV", "2"))
-_LWD_HOST_STAGE_SLOTS = 2
+# LWD_ASCEND_LWD_MAX_INFLIGHT_RECV. The historical hard cap of 2 throttled
+# the UCX UP supply: an edge UCX send completes only when its cloud posts
+# the matching receive (rendezvous), so the effective edge run-ahead is
+# min(edge staging, cloud depth) -- at depth 2 the edge could never run
+# ahead of the cloud's ~1.5s/step consumption cadence during 128k prefill
+# drain, starving both instances' EMBED on the shared single-card edge.
+# HCCL tolerates depth 2 because isends pre-queue in the communicator
+# (the edge pending-chunks gate, not recv posting, governs run-ahead),
+# which is why the HCCL build met the bar at the same constant. The
+# performance-proven sidecar branch runs 8; match it.
+_LWD_EARLY_RECV_MAX_INFLIGHT = int(os.environ.get("LWD_ASCEND_LWD_MAX_INFLIGHT_RECV", "8"))
 _LWD_SHUTDOWN_TIMEOUT_S = 5.0
 
 
@@ -138,7 +142,21 @@ class LwdCloudWorker(LwdWorkerBase):
         self._register_lwd_prompt_embeds_provider()
 
     def _lwd_init_lwd_host_stager(self) -> None:
-        """Create endpoint host staging with fixed limits."""
+        """Create endpoint host staging sized to the receive depth.
+
+        The landing-slot pool must cover the full inflight depth -- a
+        smaller pool silently re-caps the pump (allocate raises
+        LwdHostStageSlotBusy and the hint bounces back to pending), so
+        effective depth = min(inflight, slots). Slots are therefore
+        derived, not hard-coded: one landing buffer per in-flight entry,
+        per connection this endpoint owns. Multi-instance (1 edge, N
+        clouds) gives each cloud container a single connection, so slots
+        equal the inflight depth; cloud-reuse (1 cloud, N edges) scales
+        them per edge. Each slot is an NPU buffer of max_numel (~80MB for
+        an 8192-row chunk), so depth 8 costs ~640MB device memory on the
+        endpoint rank -- the price of a UCX run-ahead the edge can
+        actually drain from.
+        """
         self._early_recv_max_inflight = _LWD_EARLY_RECV_MAX_INFLIGHT
         max_numel = hash_payload_numel(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
@@ -146,7 +164,14 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_up_num_hash_layers,
             self._lwd_up_num_experts_per_tok,
         )
-        self._lwd_stager = LwdHostStager(device=str(self.device), slots=_LWD_HOST_STAGE_SLOTS, max_numel=max_numel)
+        slots = self._early_recv_max_inflight * max(1, len(self._lwd_early_recv_connections))
+        self._lwd_stager = LwdHostStager(device=str(self.device), slots=slots, max_numel=max_numel)
+        lwd_logger.info(
+            "[Lwd][pre-recv] host stager slots=%d (inflight=%d x connections=%d)",
+            slots,
+            self._early_recv_max_inflight,
+            len(self._lwd_early_recv_connections),
+        )
 
     def load_model(self) -> None:
         """Log the real layer split after loading: layer count / first-last
