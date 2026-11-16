@@ -62,14 +62,12 @@ if TYPE_CHECKING:
 _LWD_EARLY_RECV_DEQUEUE_TIMEOUT_S = 0.0005
 _LWD_EARLY_RECV_ERROR_SLEEP_S = 0.01
 _LWD_EARLY_RECV_LOOP_SLEEP_S = 0.002
-# Posted-but-unconsumed early UP receives (cloud endpoint). The old hard cap
-# of 2 starved the edge (4 staging blocks vs 2 credits: two blocks could
-# never be returned -> staging starved, embed batches stalled). The
-# performance-proven sidecar branch runs 8: an in-flight entry is pipeline
-# bookkeeping, not an NPU-memory bound (the host-direct receive releases
-# credit once the CPU->CPU staging memcpy completes), so depth costs nothing.
-# Keep it >= the edge's pending-chunks gate, else widening the edge gate
-# has no effect.
+# Posted-but-unconsumed early UP receives (cloud endpoint), env-tunable via
+# LWD_ASCEND_LWD_MAX_INFLIGHT_RECV. The performance-proven sidecar branch
+# runs 8 (an in-flight entry is pipeline bookkeeping, not an NPU-memory
+# bound, and depth should be >= the edge's pending-chunks gate). Default
+# stays at the historical 2 pending a clean perf validation of the wider
+# pipeline; set the env to 8 to test.
 _LWD_EARLY_RECV_MAX_INFLIGHT = int(os.environ.get("LWD_ASCEND_LWD_MAX_INFLIGHT_RECV", "2"))
 _LWD_HOST_STAGE_SLOTS = 2
 _LWD_SHUTDOWN_TIMEOUT_S = 5.0
@@ -103,8 +101,7 @@ class LwdCloudWorker(LwdWorkerBase):
         if not self._lwd_connections:
             self._lwd_connections = (ConnectionId(0, lwd_config.instance.id, self._lwd_dp_idx),)
         global_rank = dist.get_rank()
-        self._lwd_is_host_comm = lwd_config.topology.is_host_comm
-        if self._lwd_is_host_comm:
+        if lwd_config.topology.is_host_comm:
             # Host links terminate at TP rank 0 of this instance world.
             tp0_rank = global_rank - get_tensor_model_parallel_rank()
             self._lwd_up_src_ranks = {connection: tp0_rank for connection in self._lwd_connections}
@@ -149,12 +146,7 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_up_num_hash_layers,
             self._lwd_up_num_experts_per_tok,
         )
-        self._lwd_stager = LwdHostStager(
-            device=str(self.device),
-            slots=_LWD_HOST_STAGE_SLOTS,
-            max_numel=max_numel,
-            direct_staging=self._lwd_is_host_comm,
-        )
+        self._lwd_stager = LwdHostStager(device=str(self.device), slots=_LWD_HOST_STAGE_SLOTS, max_numel=max_numel)
 
     def load_model(self) -> None:
         """Log the real layer split after loading: layer count / first-last

@@ -7,7 +7,6 @@ import importlib.util
 import logging
 import sys
 import types
-from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
@@ -23,38 +22,9 @@ fake_vllm = types.ModuleType("vllm")
 fake_logger_module = types.ModuleType("vllm.lwd_logger")
 fake_logger_module.lwd_logger = logging.getLogger("lwd-host-stage-test")
 fake_vllm.lwd_logger = fake_logger_module
-
-
-# The staging module imports ConnectionId from the data-plane types, whose
-# package __init__ pulls in vllm and torch. The tests only need the identity
-# fields and ordering, so stub that leaf module instead of the whole package.
-@dataclass(frozen=True, order=True)
-class _ConnectionId:
-    edge_id: int
-    cloud_id: int
-    dp_idx: int
-
-
-fake_vllm_ascend = types.ModuleType("vllm_ascend")
-fake_distributed = types.ModuleType("vllm_ascend.distributed")
-fake_data_plane = types.ModuleType("vllm_ascend.distributed.lwd_data_plane")
-fake_types = types.ModuleType("vllm_ascend.distributed.lwd_data_plane.lwd_types")
-fake_types.ConnectionId = _ConnectionId
-fake_vllm_ascend.distributed = fake_distributed
-fake_distributed.lwd_data_plane = fake_data_plane
-fake_data_plane.lwd_types = fake_types
-
 with mock.patch.dict(
     sys.modules,
-    {
-        "vllm": fake_vllm,
-        "vllm.lwd_logger": fake_logger_module,
-        "torch": None,
-        "vllm_ascend": fake_vllm_ascend,
-        "vllm_ascend.distributed": fake_distributed,
-        "vllm_ascend.distributed.lwd_data_plane": fake_data_plane,
-        "vllm_ascend.distributed.lwd_data_plane.lwd_types": fake_types,
-    },
+    {"vllm": fake_vllm, "vllm.lwd_logger": fake_logger_module, "torch": None},
 ):
     SPEC.loader.exec_module(module)
 
@@ -617,47 +587,3 @@ def test_mixed_batch_skips_old_generation_without_shifting_sources() -> None:
     assert stager.release_if_drained(3)
     assert stager.release_request("live") == 24
     assert stager.release_if_drained(1)
-
-
-def test_recv_slot_follows_the_data_plane() -> None:
-    """The host data plane allocates no receive buffer at all.
-
-    The frame already lands in transport-owned host memory and the staging
-    buffers live there too, so the slot only carries in-flight accounting; the
-    device plane keeps its NPU slot for HCCL to write into.
-    """
-    made: list[str] = []
-
-    def host_factory(numel: int) -> FakeBuffer:
-        made.append("host")
-        return FakeBuffer(numel)
-
-    def device_factory(numel: int) -> FakeBuffer:
-        made.append("device")
-        return FakeBuffer(numel)
-
-    host_stager = LwdHostStager(
-        device="cpu",
-        slots=1,
-        max_numel=0,
-        empty_factory=host_factory,
-        device_factory=device_factory,
-        direct_staging=True,
-    )
-    host_buffer, slot = host_stager.allocate(0, 8)
-    assert host_buffer is None
-    assert slot == 0
-    assert host_stager.busy_slots() == [0]
-    assert made == []
-
-    device_stager = LwdHostStager(
-        device="cpu",
-        slots=1,
-        max_numel=0,
-        empty_factory=host_factory,
-        device_factory=device_factory,
-    )
-    device_buffer, slot = device_stager.allocate(0, 8)
-    assert device_buffer.numel() == 8
-    assert slot == 0
-    assert made == ["device"]

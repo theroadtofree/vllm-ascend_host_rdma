@@ -165,15 +165,10 @@ class LwdHostTransferQueue(LwdTransferQueue):
     ) -> LwdTransferFuture:
         # Exact-size buffer, same contract as the HCCL queue (the sender's
         # frame length must match; the IO callback validates on arrival).
-        # A staged receive may omit the buffer entirely: the UCX frame already
-        # lands in host memory owned by the transport and the staging targets
-        # live there too, so the callback copies each segment straight from the
-        # received block instead of materialising an intermediate buffer.
         buffer = req.recv_buffer
-        stage_from_block = buffer is None and req.stage_segments is not None
-        if buffer is None and not stage_from_block:
+        if buffer is None:
             buffer = torch.empty(req.num_elements, dtype=torch.bfloat16, device="npu")
-        elif buffer is not None:
+        else:
             buffer_elements = buffer.numel()  # symbolic-meta-ok: buffer size check, not a meta shape
             if buffer_elements != req.num_elements:
                 raise RuntimeError(
@@ -186,18 +181,14 @@ class LwdHostTransferQueue(LwdTransferQueue):
         if req.aux_num_elements > 0:
             if self.channel_type is not LwdChannelType.UP:
                 raise RuntimeError("aux payload is only supported on the UP channel")
-            # The aux slice rides the same frame, so it lands wherever the
-            # main payload lands (host for a host-plane staged receive).
             aux_buffer = torch.empty(
                 req.aux_num_elements,
                 dtype=req.aux_dtype or torch.int64,
-                device=buffer.device if buffer is not None else "cpu",
+                device="npu",
             )
         # Descramble runs on the channel stream after H2D and before the
         # completion event is recorded — the same point the HCCL queue
-        # applies it. Direct staging applies it per segment instead, after
-        # each copy (the transform is a constant XOR, so a segment can be
-        # undone on its own).
+        # applies it.
         seed = lwd_scramble_seed_for(req)
         post_h2d = None
         if seed is not None:
