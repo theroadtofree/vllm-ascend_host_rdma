@@ -12,6 +12,7 @@ unchanged, this only restores the native worker↔runner division.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from collections import deque
 from typing import TYPE_CHECKING
@@ -73,6 +74,16 @@ _LWD_SLOW_BATCH_MS = float(os.environ.get("LWD_SLOW_BATCH_MS", "1000"))
 # DOWN receive cadence watchdog: gap past this between consecutive UNEMBEDs
 # of one connection logs an ERROR (that instance's decode is starving).
 _LWD_DOWN_GAP_WARN_S = float(os.environ.get("LWD_DOWN_GAP_WARN_S", "5.0"))
+# Stall heartbeat: a daemon thread that beats every N seconds and reports
+# (ERROR) any batch still holding the loop past _LWD_LOOP_HOLD_WARN_S WHILE
+# it holds it. Two facts the after-the-fact probes cannot give:
+#   1. heartbeats present during a long hold => the process is alive and the
+#      DOWN frame is genuinely absent (a logical stall on the data plane);
+#      heartbeats absent + a "heartbeat gap" line on wake => the whole
+#      process/host was frozen or CPU-starved (OS/driver level, not LWD).
+#   2. whether the recv future is still UNBOUND (no frame arrived yet) vs
+#      BOUND (frame landed, stuck later in the chain).
+_LWD_STALL_HEARTBEAT_S = 10.0
 
 
 class LwdEdgeModelRunner(LwdBaseModelRunner):
@@ -97,6 +108,103 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         self._lwd_loop_window_total = 0.0
         # DOWN receive cadence watchdog: last UNEMBED arrival per connection.
         self._lwd_unembed_last_arrival: dict[ConnectionId, float] = {}
+        # Stall heartbeat context: set only while a DOWN recv wait is in
+        # flight (connection, seqno, wait-start ts, future); the observer
+        # thread below reads it between beats.
+        self._lwd_down_wait: tuple[ConnectionId, int, float, LwdTransferFuture] | None = None
+        self._lwd_last_heartbeat = time.monotonic()
+        threading.Thread(
+            target=self._lwd_stall_heartbeat,
+            name="lwd-edge-stall-heartbeat",
+            daemon=True,
+        ).start()
+
+    def _lwd_stall_heartbeat(self) -> None:
+        """Observe-only: witness long loop holds WHILE they hold.
+
+        The after-the-fact probes (HELD/share/slow-batch) only fire once the
+        blocking batch finally releases, so a frozen hour looks identical to
+        an idle hour. This thread beats every _LWD_STALL_HEARTBEAT_S and
+        reports any in-flight DOWN wait, plus detects its own scheduling
+        gaps: a "heartbeat gap" line means the thread itself could not run —
+        the whole process/host was frozen or CPU-starved, not LWD logic.
+        """
+        while True:
+            time.sleep(_LWD_STALL_HEARTBEAT_S)
+            now = time.monotonic()
+            gap = now - self._lwd_last_heartbeat
+            self._lwd_last_heartbeat = now
+            if gap > _LWD_STALL_HEARTBEAT_S * 3:
+                lwd_logger.error(
+                    "[Lwd][edge-loop] heartbeat gap %.1fs -- the heartbeat "
+                    "thread itself could not run; the whole process/host was "
+                    "frozen or CPU-starved in between (not LWD logic)",
+                    gap,
+                )
+            wait = self._lwd_down_wait
+            if wait is not None:
+                conn, seqno, t0, fut = wait
+                elapsed = now - t0
+                if elapsed >= _LWD_LOOP_HOLD_WARN_S:
+                    try:
+                        frame_state = (
+                            "BOUND (frame arrived; stuck later in the chain)"
+                            if fut._done_event is not None
+                            else "ABSENT (no DOWN frame reached this recv yet)"
+                        )
+                    except Exception:  # noqa: BLE001
+                        frame_state = "UNKNOWN"
+                    queue_state = ""
+                    try:
+                        # Decisive discriminator for the deferred-hole freeze:
+                        # if this recv sits in the queue's _held (its seqno is
+                        # ahead of _next_seqno), the recv was never posted to
+                        # UCX and the wait can only end when the missing lower
+                        # seqno arrives or is skipped -- i.e. the peer burned/
+                        # lost a seqno (exception between its seqno allocation
+                        # and the wire), not a slow frame.
+                        from vllm_ascend.distributed.lwd_data_plane.lwd_data_plane import (
+                            lwd_get_data_plane,
+                        )
+
+                        _q = lwd_get_data_plane()._queues.get((conn, LwdChannelType.DOWN, "recv"))
+                        if _q is not None:
+                            queue_state = (
+                                f" recv_queue_next={_q._next_seqno}"
+                                f" held={sorted(_q._held)}"
+                                f" this_recv={'HELD-DEFERRED (never posted to UCX)'
+                                if seqno in _q._held else 'posted'}"
+                            )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    lwd_logger.error(
+                        "[Lwd][edge-loop] still waiting for DOWN seqno=%s "
+                        "instance=edge%d for %.1fs: frame=%s%s (process alive, "
+                        "so the cloud sent nothing this connection)",
+                        seqno,
+                        conn.edge_id,
+                        elapsed,
+                        frame_state,
+                        queue_state,
+                    )
+                    continue
+            batch = self._lwd_loop_batch
+            if batch is not None:
+                kind, conn, seqno, t0 = batch
+                elapsed = now - t0
+                # Cap at 10 minutes: beyond that the loop is simply idle
+                # (benchmark drained) and endless lines would spam the log;
+                # a frozen host shows up as heartbeat-gap lines instead.
+                if _LWD_LOOP_HOLD_WARN_S <= elapsed < 600.0:
+                    lwd_logger.error(
+                        "[Lwd][edge-loop] no new batch for %.1fs; last is %s "
+                        "seqno=%s instance=edge%d (scheduler gate/no-notify "
+                        "idle, or stuck inside that batch)",
+                        elapsed,
+                        kind,
+                        seqno,
+                        conn.edge_id,
+                    )
 
     def _lwd_note_loop_batch(self, kind: str, connection: ConnectionId, seqno: int) -> None:
         """Stamp loop occupancy at batch entry; attribute the PREVIOUS
@@ -415,9 +523,35 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             )
         )
         _t_post = time.monotonic()
-        # wait_on_current_stream: device-ordered wait; the host never blocks
-        recv_future.wait_on_current_stream()
-        result = recv_future.result()
+        # Stall heartbeat context: while this wait is in flight the observer
+        # thread can report seqno/elapsed/frame-state, and the outcome line
+        # below tells whether a long wait ended by the frame finally arriving
+        # or by an error -- the after-the-fact HELD line cannot say which.
+        self._lwd_down_wait = (connection, seqno, _t0, recv_future)
+        try:
+            # wait_on_current_stream: device-ordered wait; the host never blocks
+            recv_future.wait_on_current_stream()
+            result = recv_future.result()
+        except BaseException:
+            self._lwd_down_wait = None
+            if time.monotonic() - _t_post >= _LWD_LOOP_HOLD_WARN_S:
+                lwd_logger.error(
+                    "[Lwd][down-wait] seqno=%s instance=edge%d DOWN wait "
+                    "FAILED after %.1fs (exception, not a late frame)",
+                    seqno,
+                    connection.edge_id,
+                    time.monotonic() - _t_post,
+                )
+            raise
+        self._lwd_down_wait = None
+        if time.monotonic() - _t_post >= _LWD_LOOP_HOLD_WARN_S:
+            lwd_logger.error(
+                "[Lwd][down-wait] seqno=%s instance=edge%d DOWN wait ended "
+                "after %.1fs -- the frame finally arrived (no exception)",
+                seqno,
+                connection.edge_id,
+                time.monotonic() - _t_post,
+            )
         # The receive tensor was allocated on the channel stream but is
         # consumed by lm_head on the compute stream. Keep its allocation
         # alive until that stream's work completes, including after the

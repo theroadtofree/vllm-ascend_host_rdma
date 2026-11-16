@@ -188,11 +188,26 @@ class LwdTransferQueue:
                 return self._held[seqno][1]
             future = LwdTransferFuture.deferred(request)
             self._held[seqno] = (request, future)
-            logger.debug(
-                "[lwd-comm] held out-of-order %s %s seqno=%d (next=%d)",
+            # Out-of-order submission is NEVER legal on this plane in healthy
+            # operation: seqno k is consumed only when the peer's matching
+            # frame/notify exists, so a hole at _next_seqno means the peer
+            # burned or lost seqno _next_seqno (exception between its seqno
+            # allocation and the wire/notify). Every later op then sits here
+            # deferred -- never posted -- and its waiter blocks indefinitely
+            # until the hole is skipped (skip_seqno) or filled. ERROR, not
+            # debug: this line is the smoking gun for the minutes-scale
+            # UNEMBED freezes.
+            logger.error(
+                "[lwd-comm] HELD out-of-order %s %s connection=%s seqno=%d "
+                "(next expected %d, %d held): the peer lost/skipped seqno "
+                "%d -- every later op on this FIFO is deferred until the "
+                "hole is filled or skipped",
                 self.channel_type.value,
-                request.op,
+                self.op,
+                self.connection,
                 seqno,
+                self._next_seqno,
+                len(self._held),
                 self._next_seqno,
             )
             return future
