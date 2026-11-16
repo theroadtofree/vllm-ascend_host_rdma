@@ -243,13 +243,14 @@ class LwdNpuUcxChannelIo:
         if self._tr_submit_recv:
             self._tr_submit_recv = False
             logger.error(
-                "[lwd-ucx-trace] %s SUBMIT_RECV seqno=%s tag=%d numel=%s aux_numel=%s stage=%s",
+                "[lwd-ucx-trace] %s SUBMIT_RECV seqno=%s tag=%d numel=%s aux_numel=%s stage=%s host_direct=%s",
                 self.tag,
                 seqno,
                 tag,
-                buffer.numel(),  # symbolic-meta-ok: log-only size, not a meta shape
+                buffer.numel() if buffer is not None else 0,  # symbolic-meta-ok: log-only size
                 aux_buffer.numel() if aux_buffer is not None else 0,  # symbolic-meta-ok: log-only size
                 req.stage_segments is not None,
+                getattr(req, "host_stage_segments", None) is not None,
             )
         self._ch.recv(tag, cb=self._recv_cb(buffer, aux_buffer, future, req, post_h2d))
 
@@ -418,6 +419,54 @@ class LwdNpuUcxChannelIo:
                 return
             data = op.data
             try:
+                # Direct CPU->CPU path: the request carries pinned host
+                # destinations, so the arrived frame is segmented-memcpy'd
+                # straight into the per-request pinned buffers. No NPU
+                # slot, no H2D, no D2H back-out — the frame is fully
+                # consumable the moment the copies return, so the
+                # completion is a HOST event (inflight credit turns on
+                # memcpy speed, not PCIe round-trips). Guarded by the same
+                # size check; descramble (post_h2d) is unsupported here
+                # (the LWD UP scramble is off in host deployments that
+                # enable this path -- fail loud rather than corrupt).
+                host_segments = getattr(req, "host_stage_segments", None)
+                if host_segments is not None:
+                    if post_h2d is not None:
+                        raise RuntimeError(
+                            f"descramble unsupported on the host-direct recv "
+                            f"path ({tag_str} seqno={req.seqno}); disable "
+                            "feature_ctrl.scramble or the host-direct path"
+                        )
+                    mv = memoryview(data)
+                    element_size = 2  # bf16, the only wire dtype on UP
+                    expected = sum(numel for _, _, numel in host_segments) * element_size
+                    if expected != len(data):
+                        err = ConnectionError(
+                            f"payload size mismatch on {tag_str}: got {len(data)}B "
+                            f"expect host segments {expected}B"
+                        )
+                        future._finalize(error=err)
+                        self._ch.fail(err)
+                        return
+                    for dst, src_off, numel in host_segments:
+                        src_bytes = numel * element_size
+                        dst.copy_(
+                            torch.frombuffer(
+                                mv[src_off * element_size : src_off * element_size + src_bytes],
+                                dtype=dst.dtype,
+                            )
+                        )
+                    done_event = LwdHostDoneEvent()
+                    done_event.set()
+                    future._bind(
+                        handles=[],
+                        done_event=done_event,
+                        tensor=None,
+                        keepalive=(data,),
+                        aux_tensor=None,
+                        staged_event=None,
+                    )
+                    return
                 payload_len = self._nbytes(buffer)
                 aux_len = self._nbytes(aux_buffer) if aux_buffer is not None else 0
                 if payload_len + aux_len != len(data):

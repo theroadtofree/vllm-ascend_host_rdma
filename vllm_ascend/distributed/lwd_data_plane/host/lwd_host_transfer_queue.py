@@ -137,6 +137,14 @@ class LwdHostTransferQueue(LwdTransferQueue):
         io: Any,
         into: LwdTransferFuture | None,
     ) -> LwdTransferFuture:
+        # Host-direct path: destinations are pinned host views carried on
+        # the request; the IO callback memcpys the arrived frame CPU->CPU.
+        # No device buffer is allocated and no descramble hook is built
+        # (the callback fails loud if scramble would be required).
+        if getattr(req, "host_stage_segments", None) is not None:
+            future = into or LwdTransferFuture(req, [], None)
+            io.submit_recv(req.seqno, req, None, None, future, post_h2d=None)
+            return future
         # Exact-size buffer, same contract as the HCCL queue (the sender's
         # frame length must match; the IO callback validates on arrival).
         buffer = req.recv_buffer

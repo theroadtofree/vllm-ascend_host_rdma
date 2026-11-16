@@ -101,6 +101,15 @@ class LwdTransferRequest:
     # recv: optional segmented D2H destinations. Each tuple contains a pinned
     # host view, a flat source element offset, and the number of elements.
     stage_segments: list[tuple[Any, int, int]] | None = None
+    # recv (UCX host-RoCE only): direct CPU->CPU segmented destinations.
+    # Each tuple is (pinned host destination view, flat source element
+    # offset, numel) — the same layout as ``stage_segments``, but consumed
+    # by the IO receive callback as plain host memcpys from the arrived
+    # frame, skipping the device round-trip entirely (no NPU slot, no H2D
+    # + D2H). Takes precedence over stage_segments/recv_buffer; the
+    # completion is a HOST event (LwdHostDoneEvent), so inflight credit
+    # turns on memcpy speed instead of PCIe round-trips.
+    host_stage_segments: list[tuple[Any, int, int]] | None = None
 
     @property
     def connection(self) -> ConnectionId:

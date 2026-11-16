@@ -71,6 +71,11 @@ _LWD_DOWN_GAP_WARN_S = float(os.environ.get("LWD_DOWN_GAP_WARN_S", "5.0"))
 # [Lwd][perf] cloud-exec ERROR (decode steady state ~20ms stays silent);
 # env-tunable. 0 logs every step (old behaviour).
 _LWD_SLOW_EXEC_LOG_MS = float(os.environ.get("LWD_SLOW_EXEC_LOG_MS", "1000"))
+# UP receive path: 1 (default) = host-direct — the IO callback memcpys the
+# arrived frame CPU->CPU into the per-request pinned buffers (one local
+# copy per frame instead of three, no NPU slot round-trip). 0 = legacy
+# device path (H2D into an NPU slot + D2H back out).
+_LWD_UP_HOST_DIRECT = os.environ.get("LWD_UP_HOST_DIRECT", "1") != "0"
 
 
 class LwdCloudWorker(LwdWorkerBase):
@@ -500,7 +505,17 @@ class LwdCloudWorker(LwdWorkerBase):
         self._early_recv_pump()
 
     def _lwd_submit_early_recv(self, fields: LwdRecvHintFields) -> LwdTransferFuture:
-        """Plan host destinations, allocate a device slot, and submit one receive."""
+        """Plan host destinations, allocate a device slot, and submit one receive.
+
+        Host-direct path (default): the frame is memcpy'd CPU->CPU straight
+        into the per-request pinned buffers by the IO callback -- no NPU
+        slot, no H2D+D2H round-trip, one local copy per frame instead of
+        three. ``plan_recv_segments`` destinations are already pinned host
+        views, so they pass unchanged as ``host_stage_segments``; the device
+        slot allocation is skipped entirely (publish_received tolerates a
+        missing slot). Set LWD_UP_HOST_DIRECT=0 to fall back to the device
+        round-trip path.
+        """
         stager = self._lwd_stager
         assert stager is not None
         numel = hash_payload_numel(
@@ -510,6 +525,23 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_up_num_experts_per_tok,
         )
         stage_key = (fields.connection, fields.seqno)
+        if _LWD_UP_HOST_DIRECT:
+            segments = stager.plan_recv_segments(
+                seqno=stage_key,
+                numel=numel,
+                hidden_size=self._lwd_up_hidden_size,
+                req_ids=fields.req_ids,
+                num_tokens_per_req=fields.rows,
+                prompt_lens=fields.prompt_lens,
+                row_base=fields.prompt_offsets,
+                num_hash_layers=self._lwd_up_num_hash_layers,
+                num_experts_per_tok=self._lwd_up_num_experts_per_tok,
+                refills=fields.refills,
+                prefix_nonces=fields.prefix_nonces,
+            )
+            request = self._lwd_build_up_recv_request(fields, None, segments)
+            request.host_stage_segments = segments
+            return lwd_get_data_plane().submit_recv(request)
         recv_buffer, _slot = stager.allocate(stage_key, numel)
         segments = stager.plan_recv_segments(
             seqno=stage_key,
