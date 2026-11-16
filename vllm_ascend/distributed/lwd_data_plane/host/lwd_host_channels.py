@@ -11,8 +11,9 @@ No global ranks, no LwdParallelGroupsSpec, no world collectives.
 Link model:
   * per DP connection, TWO UHC1 links (UP/DOWN), each an independent
     LwdUcxChannel with its own UCP endpoint, IO thread and block pool;
-  * the cloud DP binds ONE shared ``LwdUcxListener`` on its ``data_port`` and
-    both links attach via ``serve_via``; the handshake token (blake2b over
+  * the cloud DP binds ONE shared ``LwdUcxListener`` on its ``data_port``,
+    reused by every edge connected to that DP; both links of each connection
+    attach via ``serve_via``; the handshake token (blake2b over
     "edge_id:cloud_id:dp_idx:channel") routes each incoming TCP connection to
     its channel;
   * the edge never listens: its UP/send and DOWN/recv IOs connect out (UHC1 is
@@ -271,16 +272,29 @@ def lwd_init_host_channels() -> None:
             )
         addr = conn.cloud.addr
         port = conn.cloud.data_port  # used exactly as configured
-        # Cloud DP: one shared listener per DP connection; both links
-        # (UP recv / DOWN send) attach to it via serve_via, token-routed.
+        # Cloud DP: one listener shared by every connection of that DP;
+        # both links (UP recv / DOWN send) attach to it via serve_via,
+        # token-routed. A second edge of the same DP must REUSE it: the
+        # listener binds in its constructor, so building another one on
+        # the same data_port would fail the bind.
         # Daemon mode is the exception: the listener lives INSIDE the
         # transport daemon (spawned on demand by ucx_port over the ctl
         # socket); the engine-side channels ATTACH there instead, so no
         # engine-side listener may be built (old-branch semantics).
         listener = None
         if role == "cloud" and not _sidecar:
-            listener = LwdUcxListener(addr, port)
-            _UCX_LISTENERS[(connection.cloud_id, connection.dp_idx)] = listener
+            listener_key = (connection.cloud_id, connection.dp_idx)
+            listener = _UCX_LISTENERS.get(listener_key)
+            if listener is None:
+                listener = LwdUcxListener(addr, port)
+                _UCX_LISTENERS[listener_key] = listener
+                logger.info(
+                    "[LWD] host listener bound for cloud=%d dp_idx=%d on %s:%d",
+                    connection.cloud_id,
+                    connection.dp_idx,
+                    addr,
+                    port,
+                )
         for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
             # Edge: UP sender / DOWN receiver, both connect out (the edge
             # never listens -- UHC1 is full-duplex). Cloud: UP receiver /
