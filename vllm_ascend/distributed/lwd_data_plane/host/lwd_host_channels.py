@@ -313,7 +313,18 @@ def lwd_init_host_channels() -> None:
                 serve = True
             _UCX_IOS[(connection.edge_id, connection.cloud_id, connection.dp_idx, channel, op)] = LwdNpuUcxChannelIo(
                 channel,
-                torch.npu.Stream(priority=-1),
+                # Default priority, same as the performance-proven old repo:
+                # this stream carries the UP chunk D2H (tens of MB per frame)
+                # and the DOWN landing H2D. A priority=-1 stream is scheduled
+                # only when the compute stream leaves the device idle; under
+                # dual-instance load the edge's single card runs both
+                # instances' embed/lm_head back-to-back, the low-priority
+                # copies starve for seconds per frame, the 4 staging blocks
+                # saturate and the whole UP pipeline collapses to ~1
+                # chunk/25s (measured: sends-stuck ages 45-135s) -- while
+                # single-instance leaves compute gaps and stays fine, and
+                # HCCL (device P2P, no host copies) is immune.
+                torch.npu.Stream(),
                 LwdNpuUcxChannelIoConfig(
                     op=op,
                     up_block_mb=up_block_mb,
