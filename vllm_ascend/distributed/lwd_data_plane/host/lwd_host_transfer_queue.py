@@ -114,6 +114,29 @@ class LwdHostTransferQueue(LwdTransferQueue):
             return self._execute_send(req, io, into)
         return self._execute_recv(req, io, into)
 
+    def _snapshot_send(self, request: LwdTransferRequest) -> LwdTransferRequest:
+        """UCX + scramble off: skip the ownership clone entirely.
+
+        Ported from the performance-proven sidecar branch (channel.py
+        _snapshot_send): the sender thread's D2H is enqueued on the
+        channel stream BEHIND the producer stream
+        (``self._stream.wait_stream(producer)`` in _do_send), so it reads
+        fully-written bytes directly from the caller's tensor -- no copy
+        is needed. Lifetime is covered by the existing reference chain:
+        out-of-order holds keep the request in ``_held``, and once
+        submitted the sender thread's task tuple holds the tensor until
+        its synchronous D2H completes (after that the staging block owns
+        the bytes). Precondition (same as the sidecar branch): the source
+        buffer must not be rewritten between submit and D2H completion --
+        satisfied by the edge's per-batch eager embed outputs and the
+        cloud's per-step DOWN outputs. Scramble enabled or aux tensors
+        fall back to the cloning base implementation.
+        """
+        seed = lwd_scramble_seed_for(request)
+        if seed is None and request.aux_tensor is None:
+            return request
+        return super()._snapshot_send(request)
+
     def _execute_send(
         self,
         req: LwdTransferRequest,
