@@ -14,6 +14,7 @@ Selected via ``parallel_config.worker_cls`` (see platform.py:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -61,7 +62,15 @@ if TYPE_CHECKING:
 _LWD_EARLY_RECV_DEQUEUE_TIMEOUT_S = 0.0005
 _LWD_EARLY_RECV_ERROR_SLEEP_S = 0.01
 _LWD_EARLY_RECV_LOOP_SLEEP_S = 0.002
-_LWD_EARLY_RECV_MAX_INFLIGHT = 2
+# Posted-but-unconsumed early UP receives (cloud endpoint). The old hard cap
+# of 2 starved the edge (4 staging blocks vs 2 credits: two blocks could
+# never be returned -> staging starved, embed batches stalled). The
+# performance-proven sidecar branch runs 8: an in-flight entry is pipeline
+# bookkeeping, not an NPU-memory bound (the host-direct receive releases
+# credit once the CPU->CPU staging memcpy completes), so depth costs nothing.
+# Keep it >= the edge's pending-chunks gate, else widening the edge gate
+# has no effect.
+_LWD_EARLY_RECV_MAX_INFLIGHT = int(os.environ.get("LWD_ASCEND_LWD_MAX_INFLIGHT_RECV", "2"))
 _LWD_HOST_STAGE_SLOTS = 2
 _LWD_SHUTDOWN_TIMEOUT_S = 5.0
 
