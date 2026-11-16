@@ -94,7 +94,8 @@ class LwdCloudWorker(LwdWorkerBase):
         if not self._lwd_connections:
             self._lwd_connections = (ConnectionId(0, lwd_config.instance.id, self._lwd_dp_idx),)
         global_rank = dist.get_rank()
-        if lwd_config.topology.is_host_comm:
+        self._lwd_is_host_comm = lwd_config.topology.is_host_comm
+        if self._lwd_is_host_comm:
             # Host links terminate at TP rank 0 of this instance world.
             tp0_rank = global_rank - get_tensor_model_parallel_rank()
             self._lwd_up_src_ranks = {connection: tp0_rank for connection in self._lwd_connections}
@@ -139,7 +140,12 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_up_num_hash_layers,
             self._lwd_up_num_experts_per_tok,
         )
-        self._lwd_stager = LwdHostStager(device=str(self.device), slots=_LWD_HOST_STAGE_SLOTS, max_numel=max_numel)
+        self._lwd_stager = LwdHostStager(
+            device=str(self.device),
+            slots=_LWD_HOST_STAGE_SLOTS,
+            max_numel=max_numel,
+            direct_staging=self._lwd_is_host_comm,
+        )
 
     def load_model(self) -> None:
         """Log the real layer split after loading: layer count / first-last

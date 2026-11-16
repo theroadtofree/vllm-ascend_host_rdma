@@ -97,6 +97,9 @@ class LwdTransferRequest:
     aux_dtype: Any | None = None
     # recv: optional caller-owned device slot for the main frame. Its numel
     # must exactly match num_elements; when omitted, the queue allocates it.
+    # Omitted together with stage_segments on the host data plane means "no
+    # landing buffer": the segments are copied straight from the received
+    # host block.
     recv_buffer: Any | None = None
     # recv: optional segmented D2H destinations. Each tuple contains a pinned
     # host view, a flat source element offset, and the number of elements.

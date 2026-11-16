@@ -369,3 +369,23 @@ def test_no_nondeterminism_sources():
             if name in {"hash", "id", "random", "time", "monotonic"}:
                 banned.append(name)
     assert not banned, banned
+
+
+def test_a_segment_descrambles_like_the_whole_payload():
+    """Host-plane direct staging undoes the scramble per staged segment, so a
+    segment must come out exactly like the same slice of a whole-payload undo.
+    """
+    scrambler = ps.LwdPayloadScrambler(device_id="ut-device", custom_factor="ut-factor")
+    seed = 0x1F2E
+    plain = torch.arange(64, dtype=torch.int16).to(torch.bfloat16)
+    scrambled = plain.clone()
+    scrambler.scramble(scrambled, seed=seed)
+
+    whole = scrambled.clone()
+    scrambler.descramble(whole, seed=seed)
+    segment = scrambled[8:24].clone()
+    scrambler.descramble(segment, seed=seed)
+
+    assert not torch.equal(scrambled, plain)
+    assert torch.equal(whole, plain)
+    assert torch.equal(segment, plain[8:24])

@@ -240,7 +240,15 @@ class LwdStagedBatch:
 
 
 class LwdHostStager:
-    """Own NPU receive slots and full-prompt pinned request buffers."""
+    """Own the receive slots and the full-prompt pinned request buffers.
+
+    A slot is the receive target of one staged UP frame: NPU memory on the
+    device data plane (HCCL writes into it). On the host data plane the frame
+    already lands in host memory owned by the transport, so the slot only
+    carries the in-flight accounting and no buffer is allocated at all
+    (``direct_staging``): staging copies each segment straight from the
+    received block.
+    """
 
     def __init__(
         self,
@@ -249,6 +257,7 @@ class LwdHostStager:
         max_numel: int = 0,
         empty_factory: LwdBufferFactory | None = None,
         device_factory: LwdBufferFactory | None = None,
+        direct_staging: bool = False,
     ) -> None:
         if slots < 1:
             raise ValueError(f"slots must be >= 1, got {slots}")
@@ -257,6 +266,7 @@ class LwdHostStager:
         self.max_numel = max_numel
         self._empty_factory = empty_factory
         self._device_factory = device_factory
+        self.direct_staging = direct_staging
         self._lock = threading.Lock()
         self._slot_buffers: dict[int, LwdBuffer] = {}
         self._slot_owner: dict[int, LwdStageKey | int] = {slot: -1 for slot in range(slots)}
@@ -343,8 +353,12 @@ class LwdHostStager:
                 self._refill_done = [item for item in self._refill_done if item[0] != connection]
         return done
 
-    def allocate(self, seqno: LwdStageKey, numel: int) -> tuple[LwdBuffer, int]:
-        """Bind a free device slot to one receive sequence number."""
+    def allocate(self, seqno: LwdStageKey, numel: int) -> tuple[LwdBuffer | None, int]:
+        """Bind a free receive slot to one receive sequence number.
+
+        Returns the receive buffer, or ``None`` when the transport stages
+        straight from its own host block (see ``direct_staging``).
+        """
         with self._lock:
             if numel < 0 or (self.max_numel and numel > self.max_numel):
                 raise LwdHostStageGeometryError(f"seqno={seqno}: numel {numel} outside slot capacity {self.max_numel}")
@@ -357,13 +371,16 @@ class LwdHostStager:
                     f"(held by seqno={sorted(self._seqno_slot, key=_stage_sort_key)})"
                 )
             slot = free_slots[0]
-            buf = self._slot_buffers.get(slot)
-            if buf is None or buf.numel() < numel:
-                buf = self._make_device_buffer(self.max_numel or numel)
-                self._slot_buffers[slot] = buf
+            buffer: LwdBuffer | None = None
+            if not self.direct_staging:
+                buffer = self._slot_buffers.get(slot)
+                if buffer is None or buffer.numel() < numel:
+                    buffer = self._make_device_buffer(self.max_numel or numel)
+                    self._slot_buffers[slot] = buffer
+                buffer = buffer[:numel]
             self._slot_owner[slot] = seqno
             self._seqno_slot[seqno] = slot
-        return buf[:numel], slot
+        return buffer, slot
 
     def abandon(self, seqno: LwdStageKey) -> None:
         """Roll back a plan and allocation whose receive was never posted."""

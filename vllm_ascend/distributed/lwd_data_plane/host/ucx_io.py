@@ -20,8 +20,13 @@ Layering and responsibilities:
     H2D + descramble and records an NPU event, then ``future._bind``; with
     stage_segments it further D2H-copies per segment into each request's pinned
     buffer and records staged_event.
+  * host-plane staged recv: when the request omits the receive buffer (the
+    host data plane stages straight from the block), the frame is copied
+    host-to-host from the received block into the request buffers, descrambled
+    per segment, and completed through host done/staged events — no receive
+    buffer and no device round trip.
   * aux: packed contiguously (payload then aux) into ONE message; the receiver
-    splits it back into two H2D copies sized by the buffers the control plane
+    splits it back into two copies sized by the buffers the control plane
     already knows.
   * skip: aborted seqnos get a pre-armed discard recv; peer-restart reset is
     not wired.
@@ -67,6 +72,10 @@ _HS_TIMEOUT_S = 600.0
 # carry seqnos; only defends the queue's non-sequenced path — at most one
 # such frame in flight at a time).
 _NO_SEQNO_TAG = 1 << 60
+
+# The UP/DOWN payload is bf16, so a direct-staged receive (no landing buffer)
+# derives the expected frame length from the request's element count.
+_PAYLOAD_ELEMENT_BYTES = 2
 
 
 @dataclass(frozen=True)
@@ -240,7 +249,7 @@ class LwdNpuUcxChannelIo:
                 self.tag,
                 seqno,
                 tag,
-                buffer.numel(),  # symbolic-meta-ok: log-only size, not a meta shape
+                buffer.numel() if buffer is not None else 0,  # symbolic-meta-ok: log-only size
                 aux_buffer.numel() if aux_buffer is not None else 0,  # symbolic-meta-ok: log-only size
                 req.stage_segments is not None,
             )
@@ -386,7 +395,7 @@ class LwdNpuUcxChannelIo:
                 return
             data = op.data
             try:
-                payload_len = self._nbytes(buffer)
+                payload_len = self._nbytes(buffer) if buffer is not None else req.num_elements * _PAYLOAD_ELEMENT_BYTES
                 aux_len = self._nbytes(aux_buffer) if aux_buffer is not None else 0
                 if payload_len + aux_len != len(data):
                     err = ConnectionError(
@@ -395,21 +404,32 @@ class LwdNpuUcxChannelIo:
                     future._finalize(error=err)
                     self._ch.fail(err)
                     return
-                with torch.inference_mode(), torch.npu.stream(stream):
-                    mv = memoryview(data)
-                    buffer.copy_(torch.frombuffer(mv[:payload_len], dtype=buffer.dtype), non_blocking=True)
-                    if aux_buffer is not None:
-                        aux_buffer.copy_(torch.frombuffer(mv[payload_len:], dtype=aux_buffer.dtype), non_blocking=True)
-                    # The HCCL queue descrambles after _bridge_and_record;
-                    # UCX must run the same logic after H2D and before
-                    # recording done_event.
-                    if post_h2d is not None:
-                        post_h2d(buffer, req)
-                    done_event = torch.npu.Event()
-                    done_event.record()
-                staged_event = None
-                if req.stage_segments is not None:
-                    staged_event = self._stage_to_buffers(buffer, req, done_event)
+                if buffer is None:
+                    # Direct staging: the frame is already in host memory and so
+                    # are the segment targets, so there is nothing to land.
+                    done_event, staged_event = self._stage_from_block(aux_buffer, req, data, payload_len, post_h2d)
+                else:
+                    if self._is_host_tensor(buffer):
+                        raise RuntimeError(
+                            f"staged receive on {tag_str} must omit recv_buffer instead of passing a host tensor"
+                        )
+                    with torch.inference_mode(), torch.npu.stream(stream):
+                        mv = memoryview(data)
+                        buffer.copy_(torch.frombuffer(mv[:payload_len], dtype=buffer.dtype), non_blocking=True)
+                        if aux_buffer is not None:
+                            aux_buffer.copy_(
+                                torch.frombuffer(mv[payload_len:], dtype=aux_buffer.dtype), non_blocking=True
+                            )
+                        # The HCCL queue descrambles after _bridge_and_record;
+                        # UCX must run the same logic after H2D and before
+                        # recording done_event.
+                        if post_h2d is not None:
+                            post_h2d(buffer, req)
+                        done_event = torch.npu.Event()
+                        done_event.record()
+                    staged_event = None
+                    if req.stage_segments is not None:
+                        staged_event = self._stage_to_buffers(buffer, req, done_event)
                 future._bind(
                     handles=[],
                     done_event=done_event,
@@ -446,3 +466,42 @@ class LwdNpuUcxChannelIo:
             staged_event = torch.npu.Event()
             staged_event.record()
         return staged_event
+
+    @staticmethod
+    def _is_host_tensor(tensor: Any) -> bool:
+        """True when the staging target lives in host (pinned) memory."""
+        return getattr(getattr(tensor, "device", None), "type", None) == "cpu"
+
+    def _stage_from_block(
+        self,
+        aux_buffer: Any,
+        req: Any,
+        data: Any,
+        payload_len: int,
+        post_h2d: Any,
+    ) -> tuple[LwdHostDoneEvent, LwdHostDoneEvent]:
+        """Stage one frame straight from the received host block.
+
+        The frame already lives in host memory and so do the per-request
+        pinned buffers, so each stage segment is copied host-to-host exactly
+        once — no landing buffer, no device memory. The descramble runs on the
+        destination right after its copy: the transform XORs one constant into
+        every element, so undoing a segment on its own matches undoing the
+        whole payload. Everything is synchronous on the lib IO thread, so both
+        completion events are host events set before the future is bound.
+        """
+        mv = memoryview(data)
+        for dst, src_off, n in req.stage_segments:
+            elem = dst.element_size()
+            start = src_off * elem
+            dst.copy_(torch.frombuffer(mv[start : start + n * elem], dtype=dst.dtype))
+            if post_h2d is not None:
+                post_h2d(dst, req)
+        if aux_buffer is not None:
+            aux_len = self._nbytes(aux_buffer)
+            aux_buffer.copy_(torch.frombuffer(mv[payload_len : payload_len + aux_len], dtype=aux_buffer.dtype))
+        done_event = LwdHostDoneEvent()
+        done_event.set()
+        staged_event = LwdHostDoneEvent()
+        staged_event.set()
+        return done_event, staged_event
