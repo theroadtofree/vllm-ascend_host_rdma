@@ -87,6 +87,28 @@ def _host_config(role: str, *, deployment: str = "in_process") -> LwdConfig:
     return LwdConfig.from_topology("host_topology.yaml", role, 0, topology)
 
 
+def _edge_share_config() -> LwdConfig:
+    """edge_share: one physical edge engine serves two logical edges, each
+    connected to its own cloud DP over a one-to-one instance link."""
+    topology = LwdTopology.from_dict(
+        {
+            "deployment": {
+                "mode": 0,
+                "scene": "edge_share",
+                "edges_num": 2,
+                "clouds_num": 2,
+                "data_plane_comm": "host",
+                "data_plane_host": {"down_buffer_size": 32},
+            },
+            "feature_ctrl": {"enable_early_recv": False},
+            "edges": [_instance(identity, "10.0.0", cloud=False) for identity in range(2)],
+            "clouds": [_instance(identity, "10.1.0", cloud=True) for identity in range(2)],
+            "instance_links": [{"edge": 0, "cloud": 0}, {"edge": 1, "cloud": 1}],
+        }
+    )
+    return LwdConfig.from_topology("host_topology.yaml", "edge", 0, topology)
+
+
 @pytest.fixture(autouse=True)
 def _host_bootstrap(monkeypatch) -> None:
     """Isolate the module registries and stub every device-side dependency."""
@@ -145,6 +167,26 @@ def test_edge_builds_no_listener(monkeypatch) -> None:
     ios = lwd_host_channels._UCX_IOS
     assert len(ios) == 4
     assert all(config.listener is None for config in (io.config for io in ios.values()))
+
+
+def test_edge_share_shared_engine_owns_every_logical_edge(monkeypatch) -> None:
+    """The one physical edge engine serves both frontends, so it must hold the
+    IO of every logical edge; a per-instance view would drop the non-primary
+    edge's links and fail its first UP submit with "no host send IO"."""
+    _init(monkeypatch, _edge_share_config())
+
+    assert _Listener.created == []
+    assert lwd_host_channels._UCX_LISTENERS == {}
+    ios = lwd_host_channels._UCX_IOS
+    assert set(ios) == {
+        (0, 0, 0, LwdChannelType.UP, "send"),
+        (0, 0, 0, LwdChannelType.DOWN, "recv"),
+        (1, 1, 0, LwdChannelType.UP, "send"),
+        (1, 1, 0, LwdChannelType.DOWN, "recv"),
+    }
+    # Each logical edge connects out to its OWN cloud, not only the primary's.
+    assert ios[(0, 0, 0, LwdChannelType.UP, "send")].config.host == "10.1.0.1"
+    assert ios[(1, 1, 0, LwdChannelType.UP, "send")].config.host == "10.1.0.2"
 
 
 def test_sidecar_cloud_leaves_the_listener_to_the_daemon(monkeypatch) -> None:
