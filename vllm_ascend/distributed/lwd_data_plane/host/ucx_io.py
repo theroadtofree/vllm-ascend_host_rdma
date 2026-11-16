@@ -61,6 +61,14 @@ BLOCKS_PER_CHANNEL = 4
 # at BLOCKS_PER_CHANNEL and silently drops the oldest frame on overflow.
 _EARLY_MAX = 4096
 _HS_TIMEOUT_S = 600.0
+# [lwd-ucx-trace] pre-post audit: a frame delayed between the caller's
+# submit and the actual UCX post (sender-thread staging wait or blocking
+# D2H behind the compute stream) is invisible to the channel-level
+# "sends stuck" watchdog, which only sees posted sends. The edge measured
+# (pre-fix) frames arriving ~1400ms after their notify, and the notify is
+# emitted after the submit -- so the delay sits here. ERROR on >=500ms with
+# the acquire/d2h split names the half.
+_SEND_PREPOST_WARN_MS = 500.0
 
 
 # Reserved tag for frames without a seqno (production request streams all
@@ -293,6 +301,7 @@ class LwdNpuUcxChannelIo:
                     future._finalize(error=exc)
 
     def _do_send(self, seqno: int | None, tensor: Any, aux_tensor: Any, future: Any) -> None:
+        _t_pickup = time.monotonic()
         payload_bytes = self._nbytes(tensor)
         aux_bytes = self._nbytes(aux_tensor) if aux_tensor is not None else 0
         total = payload_bytes + aux_bytes
@@ -305,6 +314,7 @@ class LwdNpuUcxChannelIo:
         # backpressure; blocks until one frees — the completion callback
         # releases it back; registration/rcache handled by the library).
         stg = self._ch.acquire_staging()
+        _t_acq = time.monotonic()
         sent = False
         try:
             tag = seqno if seqno is not None else _NO_SEQNO_TAG
@@ -332,6 +342,20 @@ class LwdNpuUcxChannelIo:
             future._bind(handles=[], done_event=event)
             self._ch.send(tag, stg.addr, total, ref=stg, cb=self._send_done(event, stg, future))
             sent = True
+            _t_post = time.monotonic()
+            if _t_post - _t_pickup >= _SEND_PREPOST_WARN_MS:
+                logger.error(
+                    "[lwd-ucx-trace] %s send PRE-POST slow seqno=%s "
+                    "acquire=%.1fms d2h=%.1fms total=%.1fms sq_backlog=%d "
+                    "(acquire=staging backpressure from uncompleted earlier "
+                    "sends; d2h=D2H stuck behind the compute stream)",
+                    self.tag,
+                    seqno,
+                    (_t_acq - _t_pickup) * 1000,
+                    (_t_post - _t_acq) * 1000,
+                    (_t_post - _t_pickup) * 1000,
+                    self._sq.qsize(),
+                )
         finally:
             if not sent:
                 self._ch.release_staging(stg)
