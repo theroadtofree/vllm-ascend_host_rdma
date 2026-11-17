@@ -53,6 +53,12 @@ class LwdTransferFuture:
         self._lock = threading.Lock()
         self._done_cond = threading.Condition(self._lock)
         self._finalized = False
+        # Data-arrival notification: set exactly once, by _bind (the frame
+        # landed and the IO thread handed over the event) or by _finalize
+        # (including every error path). Consumers block on the Event with
+        # NO timeout quantum -- wake latency is zero instead of the old
+        # cond.wait(0.01) poll period.
+        self._bound_or_failed = threading.Event()
 
     # ------------------------------------------------------------------ #
     # Deferred (out-of-order sequenced) support                           #
@@ -82,6 +88,10 @@ class LwdTransferFuture:
             self._keepalive = keepalive
             self._staged_event = staged_event
             self._done_cond.notify_all()
+        # Data-arrival notification: wake every consumer blocked in
+        # wait_on_current_stream/wait immediately (was: up to a 10ms poll
+        # quantum per cond.wait iteration).
+        self._bound_or_failed.set()
 
     # ------------------------------------------------------------------ #
     # Status                                                              #
@@ -118,10 +128,20 @@ class LwdTransferFuture:
     def wait(self, timeout: float | None = None) -> LwdTransferResult:
         """Block until completion (readiness-gate path)."""
         deadline = None if timeout is None else time.monotonic() + timeout
+        # Deferred (unbound) phase: wait on the arrival notification OUTSIDE
+        # the cond monitor -- one wakeup on bind/error instead of the old
+        # cond poll quantum. Timeout semantics preserved (None = forever).
+        with self._done_cond:
+            unbound = self._status is LwdTransferStatus.PENDING and self._done_event is None
+        if unbound:
+            remaining = (
+                None if deadline is None else max(0.0, deadline - time.monotonic())
+            )
+            self._bound_or_failed.wait(remaining)
         with self._done_cond:
             while self._status is LwdTransferStatus.PENDING:
                 if self._done_event is None:
-                    # Deferred future not yet bound; wait for _bind.
+                    # Fallback re-check (bind raced in between the phases).
                     remaining = None if deadline is None else deadline - time.monotonic()
                     if remaining is not None and remaining <= 0:
                         raise TimeoutError(
@@ -202,19 +222,24 @@ class LwdTransferFuture:
         event (pure device-side; CPU returns immediately).
 
         UCX paths bind the event asynchronously (IO thread / sender
-        thread): first wait until the future is bound — reading
+        thread): first wait until the future is bound -- reading
         ``result()`` before the bind would surface ``tensor=None`` and
-        crash the consumer.  Host-side completion events (UCX sends)
-        carry no device ordering semantics; ordering after them is a
-        no-op (their data is host-staged, already readable when set).
+        crash the consumer. This wait is a pure data-arrival
+        notification: the Event fires exactly when _bind (frame landed)
+        or _finalize (any error) runs, with no poll quantum in between.
+        Host-side completion events (UCX sends) carry no device ordering
+        semantics; ordering after them is a no-op (their data is
+        host-staged, already readable when set).
         """
-        with self._done_cond:
-            while self._done_event is None and self._status is LwdTransferStatus.PENDING:
-                self._done_cond.wait(timeout=0.01)
-            if self._status is LwdTransferStatus.ERROR:
-                raise RuntimeError(
-                    f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"
-                ) from self._error
+        if self._done_event is None and self._status is LwdTransferStatus.PENDING:
+            # Intentionally OUTSIDE the cond monitor: _bind/_finalize take
+            # the cond first and only then set the Event -- holding the
+            # cond here would deadlock the notifier.
+            self._bound_or_failed.wait()
+        if self._status is LwdTransferStatus.ERROR:
+            raise RuntimeError(
+                f"lwd-comm op failed on {self._request.channel.value} seqno={self._request.seqno}"
+            ) from self._error
         event = self._done_event
         if event is not None and not getattr(event, "is_host_event", False):
             torch.npu.current_stream().wait_event(event)
@@ -237,6 +262,7 @@ class LwdTransferFuture:
                 self._status = LwdTransferStatus.ERROR
                 self._error = error
                 self._done_cond.notify_all()
+                self._bound_or_failed.set()
                 return
             if self._status is LwdTransferStatus.PENDING:
                 self._status = (
@@ -244,3 +270,6 @@ class LwdTransferFuture:
                     if (self._done_event is not None and self._done_event.query())
                     else self._status
                 )
+        # Terminal with no error (e.g. keepalive release): unblock any
+        # consumer waiting for the arrival notification as well.
+        self._bound_or_failed.set()
