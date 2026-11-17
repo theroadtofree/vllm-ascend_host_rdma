@@ -1330,6 +1330,22 @@ def _setup_worker_and_scheduler(
                 parallel_config.worker_cls = "vllm_ascend.worker.lwd_edge_model.lwd_edge_worker.LwdEdgeWorker"
             else:
                 parallel_config.worker_cls = "vllm_ascend.worker.lwd_cloud_model.lwd_cloud_worker.LwdCloudWorker"
+            # Frontend processes (primary + attach) construct their engine
+            # client AFTER this config pass and import no LWD module of
+            # their own: route the client factory through the LWD client
+            # (READY dedupe, ROUTER handover, engine revival) here — but
+            # ONLY for the host-comm plane (data_plane_comm=host, UCX
+            # host-RoCE); device-comm (HCCL) deployments keep the native
+            # factory completely untouched. The wrapper itself also
+            # re-checks the scenario per construction, so the patch is
+            # behavior-neutral everywhere else; vllm's native
+            # core_client.py stays pristine.
+            if lwd_config.topology.is_host_comm:
+                from vllm.entrypoints.openai.lwd.lwd_async_client import (
+                    apply_lwd_async_client_patch,
+                )
+
+                apply_lwd_async_client_patch()
         else:
             hardware_profile = get_current_hardware_profile()
             if ascend_config.xlite_graph_config.enabled and hardware_profile.supports(
