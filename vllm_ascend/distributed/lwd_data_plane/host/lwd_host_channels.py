@@ -65,6 +65,13 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 _STRAGGLER_GRACE_S = 60.0
 _STRAGGLER_POLL_S = 0.1
 
+# Bounded submit-time wait for a data-plane link to leave a
+# broken/reconnect window (peer restart, network break): a send landing
+# inside the gap fails fail-fast, so it waits this long first and then
+# proceeds either way. This single wiring feeds BOTH peers, so the
+# "identical on both peers" contract holds by construction.
+LWD_SUBMIT_WAIT_READY_S = 5.0
+
 # (edge_id, cloud_id, dp_idx, channel, op) -> LwdNpuUcxChannelIo
 _UCX_IOS: dict[tuple[int, int, int, LwdChannelType, str], LwdNpuUcxChannelIo] = {}
 # (cloud_id, dp_idx) -> the cloud DP's shared listener (handshake entry only;
@@ -325,7 +332,7 @@ def lwd_init_host_channels() -> None:
     dp_rank, tp_rank = _my_dp_identity()
     up_block_mb = _resolve_up_block_mb()
     down_block_mb = _host_plane().down_buffer_size
-    submit_wait_ready_s = _host_plane().submit_wait_ready_s
+    submit_wait_ready_s = LWD_SUBMIT_WAIT_READY_S
     # Sidecar deployment: a dedicated transport daemon owns the listeners and
     # engines ATTACH through the ctl socket ("daemon" mode of open_transport).
     _sidecar = _host_plane().deployment == "sidecar"

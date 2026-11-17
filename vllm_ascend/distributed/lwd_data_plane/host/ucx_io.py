@@ -89,8 +89,9 @@ class LwdNpuUcxChannelIoConfig:
     sl: int | None = None
     submit_wait_ready_s: float = 5.0
     """Bounded submit-time wait for the link to leave a reconnect window
-    (topology ``data_plane_host.submit_wait_ready_s``); beyond it the submit
-    proceeds and fails fast like any broken-link op."""
+    (the shared code constant ``LWD_SUBMIT_WAIT_READY_S`` flows in from the
+    channel wiring; identical on both peers by construction); beyond it the
+    submit proceeds and fails fast like any broken-link op."""
 
 
 class LwdNpuUcxChannelIo:
