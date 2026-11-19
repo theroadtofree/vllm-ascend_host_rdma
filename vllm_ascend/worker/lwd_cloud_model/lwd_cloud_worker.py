@@ -419,7 +419,6 @@ class LwdCloudWorker(LwdWorkerBase):
                 for connection, mq in hint_mqs.items()
                 if mq is not None
             }
-        while not self._lwd_early_recv_stop.is_set():
             for connection, hint_mq in hint_mqs.items():
                 if connection in self._early_recv_failed_connections:
                     continue
