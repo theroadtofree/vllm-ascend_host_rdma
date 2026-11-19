@@ -588,7 +588,9 @@ def lwd_add_runtime_connection(conn: LwdDPConnection) -> bool:
         logger.exception("[LWD] runtime link %s build failed", conn.connection_id)
         return False
     _ALLOCATED_MB += pair_mb
-    logger.info(
+    # ERROR for now — the deployment reads error level only; demote once
+    # the scale-out diagnosis closes.
+    logger.error(
         "[LWD] runtime link built: connection %s -> %s:%s (role=%s, "
         "host budget %d/%d MiB)",
         conn.connection_id,
