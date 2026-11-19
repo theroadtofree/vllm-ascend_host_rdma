@@ -355,6 +355,37 @@ class LwdCloudWorker(LwdWorkerBase):
             return None
         return done_mq.export_handle()
 
+    def lwd_attach_runtime_connection_mqs(
+        self, connection_id: ConnectionId
+    ) -> Handle | None:
+        """Runtime-added connection (elastic scale-out, C-4): attach the
+        hint MQ (the engine already created it and exported its handle
+        to the env), create the done MQ, add both to the per-connection
+        dicts, and return the done MQ's handle for the engine's reader.
+
+        Idempotent: an already-attached connection just returns its
+        existing done MQ handle. Called by the engine via
+        ``collective_rpc`` — in the uniproc model this runs on the
+        engine thread; the early-recv thread picks the new MQ up on its
+        next loop iteration (per-iteration snapshot)."""
+        if connection_id in self._irecv_hint_mqs:
+            done_mq = self._irecv_done_mqs.get(connection_id)
+            if done_mq is not None:
+                return done_mq.export_handle()
+            return None
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
+            attach_hint_mq,
+            create_report_mq,
+        )
+
+        hint_mq = attach_hint_mq(connection_id)
+        if hint_mq is None:
+            return None  # the engine hasn't created it (or is not the host)
+        done_mq = create_report_mq(connection_id)
+        self._irecv_hint_mqs[connection_id] = hint_mq
+        self._irecv_done_mqs[connection_id] = done_mq
+        return done_mq.export_handle()
+
     def _lwd_early_recv_loop(self) -> None:
         """Comm thread body: take hints -> pre-post recvs; poll futures ->
         report completions.
@@ -375,8 +406,19 @@ class LwdCloudWorker(LwdWorkerBase):
             self.device,
             "attached" if self._irecv_hint_mq is not None else "none",
         )
-        hint_mqs = self._irecv_hint_mqs or {ConnectionId(0, 0, 0): self._irecv_hint_mq}
-        hint_mqs = {connection: mq for connection, mq in hint_mqs.items() if mq is not None}
+        while not self._lwd_early_recv_stop.is_set():
+            # Per-iteration snapshot: runtime-added connections (C-4)
+            # join the loop on the next tick. tuple(dict.items())
+            # completes in C — a Python-level iteration would raise on
+            # the engine thread's concurrent insert.
+            hint_mqs = dict(tuple(self._irecv_hint_mqs.items()))
+            if not hint_mqs and self._irecv_hint_mq is not None:
+                hint_mqs = {ConnectionId(0, 0, 0): self._irecv_hint_mq}
+            hint_mqs = {
+                connection: mq
+                for connection, mq in hint_mqs.items()
+                if mq is not None
+            }
         while not self._lwd_early_recv_stop.is_set():
             for connection, hint_mq in hint_mqs.items():
                 if connection in self._early_recv_failed_connections:
