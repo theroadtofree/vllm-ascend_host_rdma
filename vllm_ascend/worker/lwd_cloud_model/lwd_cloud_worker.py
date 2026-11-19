@@ -411,9 +411,15 @@ class LwdCloudWorker(LwdWorkerBase):
 
         connection_id = conn.connection_id
         # State extension on ALL Workers: the model runner on every TP
-        # rank resolves requests to connections via this tuple.
+        # rank resolves requests to connections via this tuple, and the
+        # harvest path subscripts _lwd_up_srcanks on every rank too.
         if connection_id not in self._lwd_connections:
             self._lwd_connections = (*self._lwd_connections, connection_id)
+            if hasattr(self, "_lwd_up_src_ranks"):
+                # Host comm maps every connection to the TP0 rank.
+                from vllm.distributed.parallel_state import get_tp_group
+
+                self._lwd_up_src_ranks[connection_id] = get_tp_group().ranks[0]
 
         if not lwd_host_channels._UCX_LISTENERS:
             return None  # not the endpoint Worker; state already extended
@@ -426,11 +432,6 @@ class LwdCloudWorker(LwdWorkerBase):
                     *self._lwd_early_recv_connections,
                     connection_id,
                 )
-            if hasattr(self, "_lwd_up_src_ranks"):
-                # Host comm maps every connection to the TP0 rank.
-                from vllm.distributed.parallel_state import get_tp_group
-
-                self._lwd_up_src_ranks[connection_id] = get_tp_group().ranks[0]
         return result
 
     def _lwd_early_recv_loop(self) -> None:
