@@ -528,18 +528,20 @@ def _build_connection_ios(conn: LwdDPConnection, listener: LwdUcxListener | None
 
 
 def lwd_add_runtime_connection(conn: LwdDPConnection) -> bool:
-    """The runtime half of ``lwd_init_host_channels`` (elastic scale-out,
-    phase C): one connection's two UCX links, callable mid-run on the
-    engine thread once the topology watch detected the pair. Refuses —
-    never raises — on an uninitialized plane, a non-edge caller, a missing
-    data_port or a budget shortfall; a refusal keeps the connection
-    control-plane only (the engine retries on the next topology change).
-    Idempotent: an already-built connection reports True.
+    """The runtime half of ``lwd_init_host_channels`` (elastic scale-out):
+    one connection's two UCX links, callable mid-run on the engine thread
+    once the topology watch detected the addition. Refuses — never raises
+    — on an uninitialized plane, a missing data_port, a missing shared
+    listener (cloud), or a budget shortfall; a refusal keeps the
+    connection control-plane only (the engine retries on the next
+    topology change). Idempotent: an already-built connection reports
+    True.
 
-    Only the edge adds links at runtime: the shared edge engine is the
-    sole long-lived process of the pair (a new cloud is a fresh process
-    that reads the updated yaml), and edge IOs connect out — no listener
-    is involved."""
+    Role-aware (C-3): the EDGE adds a connect-out pair (no listener);
+    the CLOUD adds a serve pair on its DP's SHARED listener — the token
+    registers through ``serve_via`` (the locked route table accepts
+    mid-run registration), and the already-retrying edge's next UHC1
+    handshake completes."""
     plan = _CACHED_PLAN
     if plan is None or not _UCX_CHANNELS_INITIALIZED:
         logger.error(
@@ -547,20 +549,27 @@ def lwd_add_runtime_connection(conn: LwdDPConnection) -> bool:
             conn.connection_id,
         )
         return False
-    if plan.role != "edge":
-        logger.error(
-            "[LWD] runtime link %s refused: only the edge adds host links at runtime",
-            conn.connection_id,
-        )
-        return False
-    if (
+    idempotent_key = (
         conn.edge_id,
         conn.cloud_id,
         conn.dp_idx,
         LwdChannelType.UP,
-        "send",
-    ) in _UCX_IOS:
+        "send" if plan.role == "edge" else "recv",
+    )
+    if idempotent_key in _UCX_IOS:
         return True  # Already built (an idempotent replay).
+    listener: LwdUcxListener | None = None
+    if plan.role == "cloud":
+        listener = _UCX_LISTENERS.get((conn.cloud_id, conn.dp_idx))
+        if listener is None:
+            logger.error(
+                "[LWD] runtime link %s refused: no shared listener for "
+                "cloud=%d dp=%d (the cloud DP's init must bind one)",
+                conn.connection_id,
+                conn.cloud_id,
+                conn.dp_idx,
+            )
+            return False
     global _ALLOCATED_MB
     pair_mb = BLOCKS_PER_CHANNEL * (plan.up_block_mb + plan.down_block_mb)
     if _ALLOCATED_MB + pair_mb > _HOST_MEM_BUDGET_MB:
@@ -574,16 +583,18 @@ def lwd_add_runtime_connection(conn: LwdDPConnection) -> bool:
         )
         return False
     try:
-        _build_connection_ios(conn, None, plan)
+        _build_connection_ios(conn, listener, plan)
     except Exception:
         logger.exception("[LWD] runtime link %s build failed", conn.connection_id)
         return False
     _ALLOCATED_MB += pair_mb
     logger.info(
-        "[LWD] runtime link built: connection %s -> %s:%s (host budget %d/%d MiB)",
+        "[LWD] runtime link built: connection %s -> %s:%s (role=%s, "
+        "host budget %d/%d MiB)",
         conn.connection_id,
         conn.cloud.addr,
         conn.cloud.data_port,
+        plan.role,
         _ALLOCATED_MB,
         _HOST_MEM_BUDGET_MB,
     )

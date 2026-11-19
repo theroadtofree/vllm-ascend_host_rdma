@@ -26,12 +26,17 @@ DOWN = LwdChannelType.DOWN
 
 
 class _FakeListener:
-    """Stands in for LwdUcxListener: records the bind and the accept start."""
+    """Stands in for LwdUcxListener: records the bind, the accept start
+    and the token route table (serve_via's register call)."""
 
     def __init__(self, host: str, port: int) -> None:
         self.host = host
         self.port = port
         self.start_calls = 0
+        self._routes: dict[int, object] = {}
+
+    def register(self, token: int, channel: object, *, name: str = "") -> None:
+        self._routes[token] = channel
 
     def start(self) -> None:
         self.start_calls += 1
@@ -39,13 +44,22 @@ class _FakeListener:
 
 class _FakeIo:
     """Stands in for LwdNpuUcxChannelIo: records the handed-in config, the
-    registered peer-restart hooks and the forced teardowns."""
+    registered peer-restart hooks and the forced teardowns; when serving
+    on a shared listener, registers the token — what the real
+    LwdUcxChannel.serve_via does at construction."""
 
-    def __init__(self, channel: LwdChannelType, stream: object, config: LwdNpuUcxChannelIoConfig) -> None:
+    def __init__(
+        self,
+        channel: LwdChannelType,
+        stream: object,
+        config: LwdNpuUcxChannelIoConfig,
+    ) -> None:
         self.channel = channel
         self.config = config
         self.peer_restart_cbs: list = []
         self.forced_teardowns: list = []
+        if config.serve and config.listener is not None:
+            config.listener.register(config.token, self)
 
     def on_peer_restart(self, cb: object) -> None:
         self.peer_restart_cbs.append(cb)
@@ -457,19 +471,68 @@ def test_runtime_add_refuses_an_uninitialized_plane(
     assert lwd_host_channels._UCX_IOS == {}
 
 
-def test_runtime_add_refuses_a_cloud_caller(
+def test_runtime_add_builds_a_cloud_pair_on_the_shared_listener(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only the edge adds links at runtime (a new cloud is a fresh
-    process reading the updated yaml)."""
+    """C-3: the cloud builds its serve pair on the shared listener at
+    runtime — UP recv / DOWN send, both registered via serve_via (the
+    token lands in the listener's locked route table), so the already
+    retrying edge's next UHC1 handshake completes."""
+    made_listeners = _run_init(monkeypatch, _cloud_share_topology(), role="cloud", instance_id=0)
+    (listener,) = made_listeners
+    edge_two_conn = LwdDPConnection(
+        1,
+        0,
+        0,
+        LwdDP(dp_idx=0, addr="10.0.0.2"),
+        LwdDP(dp_idx=0, addr="10.1.0.1", ctrl_port=7000, data_port=5560),
+    )
+    assert lwd_host_channels.lwd_add_runtime_connection(edge_two_conn) is True
+    ios = lwd_host_channels._UCX_IOS
+    # The cloud's serve pair: UP recv / DOWN send on the shared listener.
+    assert (1, 0, 0, UP, "recv") in ios, "UP recv registered"
+    assert (1, 0, 0, DOWN, "send") in ios, "DOWN send registered"
+    for channel in (UP, DOWN):
+        io = ios[(1, 0, 0, channel, "recv" if channel is UP else "send")]
+        assert io.config.serve, f"{channel} serves"
+        assert io.config.token == _link_token(1, 0, 0, channel)
+    # The token registered on the shared listener via serve_via.
+    for channel in (UP, DOWN):
+        token = _link_token(1, 0, 0, channel)
+        assert token in listener._routes, f"token {hex(token)} on listener"
+        assert listener._routes[token] is ios[(1, 0, 0, channel, "recv" if channel is UP else "send")]
+    # Idempotent replay.
+    assert lwd_host_channels.lwd_add_runtime_connection(edge_two_conn) is True
+    assert len(ios) == 4  # 2 startup + 2 runtime
+    # Budget: startup 1 pair + runtime 1 pair = 2 * 4 * (32+32) MiB.
+    assert lwd_host_channels._ALLOCATED_MB == 2 * 4 * (32 + 32)
+
+
+def test_runtime_add_refuses_a_cloud_without_a_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cloud whose listener vanished (sidecar daemon owns it, or the
+    registry was cleared) refuses the addition — the edge's UP frames
+    keep bouncing and the next increment retries."""
     _run_init(
         monkeypatch,
-        _single_instance_topology(),
+        _cloud_share_topology(),
         role="cloud",
         instance_id=0,
     )
-    assert lwd_host_channels.lwd_add_runtime_connection(_runtime_add_connection()) is False
-    assert len(lwd_host_channels._UCX_IOS) == 2  # the cloud's own pair
+    saved_listener = lwd_host_channels._UCX_LISTENERS.pop((0, 0))
+    try:
+        edge_two_conn = LwdDPConnection(
+            1,
+            0,
+            0,
+            LwdDP(dp_idx=0, addr="10.0.0.2"),
+            LwdDP(dp_idx=0, addr="10.1.0.1", ctrl_port=7000, data_port=5560),
+        )
+        assert lwd_host_channels.lwd_add_runtime_connection(edge_two_conn) is False
+        assert (1, 0, 0, UP, "recv") not in lwd_host_channels._UCX_IOS
+    finally:
+        lwd_host_channels._UCX_LISTENERS[(0, 0)] = saved_listener
 
 
 def test_runtime_add_rolls_back_a_partial_build(
