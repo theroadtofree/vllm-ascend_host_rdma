@@ -247,6 +247,12 @@ def lwd_init_host_channels() -> None:
     dp_rank, tp_rank = _my_dp_identity()
     up_block_mb = _resolve_up_block_mb()
     down_block_mb = _host_plane().down_buffer_size
+    logger.error(
+        "[LWD][ucx-block] host block sizes: up_buffer_size=%dMiB (resolved) "
+        "down_buffer_size=%dMiB",
+        up_block_mb,
+        down_block_mb,
+    )
     # Sidecar deployment: a dedicated transport daemon owns the listeners and
     # engines ATTACH through the ctl socket ("daemon" mode of open_transport).
     _sidecar = _host_plane().deployment == "sidecar"
