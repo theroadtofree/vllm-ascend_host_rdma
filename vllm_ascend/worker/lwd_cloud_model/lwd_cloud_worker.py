@@ -356,31 +356,42 @@ class LwdCloudWorker(LwdWorkerBase):
         return done_mq.export_handle()
 
     def lwd_attach_runtime_connection_mqs(
-        self, connection_id: ConnectionId
+        self, connection_id: ConnectionId, hint_handle_str: str | None = None
     ) -> Handle | None:
         """Runtime-added connection (elastic scale-out, C-4): attach the
-        hint MQ (the engine already created it and exported its handle
-        to the env), create the done MQ, add both to the per-connection
+        hint MQ, create the done MQ, add both to the per-connection
         dicts, and return the done MQ's handle for the engine's reader.
 
+        The hint MQ's handle arrives EXPLICITLY via the RPC argument:
+        env vars do NOT cross the MultiprocExecutor process boundary at
+        runtime (they only work at startup where workers inherit the
+        engine's env). Only the endpoint Worker (the one that runs the
+        early-recv thread with actual connections) does the work; others
+        return None.
+
         Idempotent: an already-attached connection just returns its
-        existing done MQ handle. Called by the engine via
-        ``collective_rpc`` — in the uniproc model this runs on the
-        engine thread; the early-recv thread picks the new MQ up on its
-        next loop iteration (per-iteration snapshot)."""
+        existing done MQ handle."""
+        if not getattr(self, "_lwd_early_recv_connections", ()):
+            return None  # not the endpoint Worker
         if connection_id in self._irecv_hint_mqs:
             done_mq = self._irecv_done_mqs.get(connection_id)
             if done_mq is not None:
                 return done_mq.export_handle()
             return None
+        from vllm.distributed.device_communicators.shm_broadcast import (
+            MessageQueue,
+        )
+
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
-            attach_hint_mq,
+            _decode_handle,
             create_report_mq,
         )
 
-        hint_mq = attach_hint_mq(connection_id)
-        if hint_mq is None:
-            return None  # the engine hasn't created it (or is not the host)
+        if hint_handle_str is None:
+            return None  # the engine didn't pass the handle (wiring bug)
+        hint_mq = MessageQueue.create_from_handle(
+            _decode_handle(hint_handle_str), 0
+        )
         done_mq = create_report_mq(connection_id)
         self._irecv_hint_mqs[connection_id] = hint_mq
         self._irecv_done_mqs[connection_id] = done_mq
