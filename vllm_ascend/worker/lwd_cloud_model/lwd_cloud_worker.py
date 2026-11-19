@@ -398,18 +398,40 @@ class LwdCloudWorker(LwdWorkerBase):
         return done_mq.export_handle()
 
     def lwd_build_runtime_connection(self, conn: Any) -> bool | None:
-        """Build one runtime connection's UCX serve pair on this Worker
-        (elastic scale-out, cloud_share C-3). Called by the EngineCore
-        via ``collective_rpc`` — the UCX listener, token route table and
-        IO registry all live in the WORKER processes, not in the
-        EngineCore. Only the endpoint Worker (the one that owns the
-        shared listener) does the work; others return None (``not my
-        job'', distinct from False ``build refused``)."""
+        """Build one runtime connection's UCX serve pair (elastic
+        scale-out, cloud_share C-3) and extend the worker's connection
+        state on EVERY TP rank. The EngineCore calls this via
+        ``collective_rpc`` on all Workers — the runner's
+        ``request_connection`` searches ``_lwd_connections`` by edge_id
+        on every rank, so the state extension cannot be endpoint-only.
+        The UCX build itself is endpoint-only (the listener owner);
+        others return None (``not my job``, distinct from False
+        ``build refused``)."""
         from vllm_ascend.distributed.lwd_data_plane.host import lwd_host_channels
 
+        connection_id = conn.connection_id
+        # State extension on ALL Workers: the model runner on every TP
+        # rank resolves requests to connections via this tuple.
+        if connection_id not in self._lwd_connections:
+            self._lwd_connections = (*self._lwd_connections, connection_id)
+
         if not lwd_host_channels._UCX_LISTENERS:
-            return None  # not the endpoint Worker
-        return lwd_host_channels.lwd_add_runtime_connection(conn)
+            return None  # not the endpoint Worker; state already extended
+        result = lwd_host_channels.lwd_add_runtime_connection(conn)
+        if result is True:
+            # Early-recv state: only the endpoint Worker consumes hints
+            # for this connection (the MQ attach RPC handles the MQs).
+            if connection_id not in self._lwd_early_recv_connections:
+                self._lwd_early_recv_connections = (
+                    *self._lwd_early_recv_connections,
+                    connection_id,
+                )
+            if hasattr(self, "_lwd_up_src_ranks"):
+                # Host comm maps every connection to the TP0 rank.
+                from vllm.distributed.parallel_state import get_tp_group
+
+                self._lwd_up_src_ranks[connection_id] = get_tp_group().ranks[0]
+        return result
 
     def _lwd_early_recv_loop(self) -> None:
         """Comm thread body: take hints -> pre-post recvs; poll futures ->
