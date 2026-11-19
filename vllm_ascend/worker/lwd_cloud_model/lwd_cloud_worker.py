@@ -386,6 +386,20 @@ class LwdCloudWorker(LwdWorkerBase):
         self._irecv_done_mqs[connection_id] = done_mq
         return done_mq.export_handle()
 
+    def lwd_build_runtime_connection(self, conn: Any) -> bool | None:
+        """Build one runtime connection's UCX serve pair on this Worker
+        (elastic scale-out, cloud_share C-3). Called by the EngineCore
+        via ``collective_rpc`` — the UCX listener, token route table and
+        IO registry all live in the WORKER processes, not in the
+        EngineCore. Only the endpoint Worker (the one that owns the
+        shared listener) does the work; others return None (``not my
+        job'', distinct from False ``build refused``)."""
+        from vllm_ascend.distributed.lwd_data_plane.host import lwd_host_channels
+
+        if not lwd_host_channels._UCX_LISTENERS:
+            return None  # not the endpoint Worker
+        return lwd_host_channels.lwd_add_runtime_connection(conn)
+
     def _lwd_early_recv_loop(self) -> None:
         """Comm thread body: take hints -> pre-post recvs; poll futures ->
         report completions.
