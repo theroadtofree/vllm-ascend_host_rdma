@@ -52,7 +52,7 @@ from vllm.v1.lwd_comm.data_comm.ucx_channel import (
 )
 from vllm.v1.lwd_comm.data_comm.ucx_port import LwdUcxTransportPort, open_transport
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
+from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdLinkError
 
 # Blocks per channel: absorbs the early frames and provides send backpressure.
 BLOCKS_PER_CHANNEL = 4
@@ -61,6 +61,9 @@ BLOCKS_PER_CHANNEL = 4
 # at BLOCKS_PER_CHANNEL and silently drops the oldest frame on overflow.
 _EARLY_MAX = 4096
 _HS_TIMEOUT_S = 600.0
+# Poll tick of the submit-time reconnect wait (hot path cost when healthy:
+# one attribute read; only a broken link ever enters the loop).
+_RECONNECT_POLL_S = 0.05
 
 
 # Reserved tag for frames without a seqno (production request streams all
@@ -84,6 +87,11 @@ class LwdNpuUcxChannelIoConfig:
     transport_mode: Literal["embedded", "daemon"] = "embedded"
     traffic_class: int | None = None
     sl: int | None = None
+    submit_wait_ready_s: float = 5.0
+    """Bounded submit-time wait for the link to leave a reconnect window
+    (the shared code constant ``LWD_SUBMIT_WAIT_READY_S`` flows in from the
+    channel wiring; identical on both peers by construction); beyond it the
+    submit proceeds and fails fast like any broken-link op."""
 
 
 class LwdNpuUcxChannelIo:
@@ -143,8 +151,13 @@ class LwdNpuUcxChannelIo:
             port=config.port,
             listener=config.listener,
         )
-        # No on_peer_restart registration (U1): transport-layer reconnect
-        # is kept, but recovery is not promised.
+        self._submit_wait_ready_s = config.submit_wait_ready_s
+        # Peer-restart recovery (embedded): the port IS the channel in
+        # embedded mode, so the session-fingerprint restart event reaches
+        # the queue/ledger resets registered by lwd_host_channels. The
+        # daemon protocol has no cross-process restart event yet, so the
+        # registration below no-ops there (sidecar keeps the
+        # whole-deployment-restart semantics).
         # Send direction: task queue + sender thread (staging blocks come
         # from the library pool via ch.acquire_staging; this layer never
         # allocates its own memory/MR).
@@ -192,6 +205,23 @@ class LwdNpuUcxChannelIo:
             "(or reduce max_num_batched_tokens/chunk size)"
         )
 
+    def _wait_reconnect_window(self) -> None:
+        """Bounded submit-time wait for the link to leave a broken/reconnect
+        window. ``wait_ready`` only reflects the FIRST link, so poll the
+        transport's live ``ready`` state (set at adopt, dropped while
+        broken); past the budget proceed and fail fast like any broken-link
+        op. The daemon port has no ``ready``: no wait, matching its no
+        cross-process recovery semantics."""
+        waited = False
+        deadline = time.monotonic() + self._submit_wait_ready_s
+        while not getattr(self._ch, "ready", True):
+            waited = True
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(_RECONNECT_POLL_S)
+        if waited:
+            logger.info("[lwd-ucx] %s submit waited out a reconnect window", self.tag)
+
     def submit_send(
         self,
         seqno: int | None,
@@ -204,6 +234,9 @@ class LwdNpuUcxChannelIo:
         # can never reach the cloud. Queueing it would leave the request
         # awaiting forever because _do_send only finalizes the future.
         self._raise_if_frame_too_large(seqno, tensor, aux_tensor)
+        # Absorb the reconnect window (peer restart / network break): a
+        # send landing inside the gap would fail its op fail-fast.
+        self._wait_reconnect_window()
         # The caller enqueues the snapshot clone asynchronously on the
         # producer stream, while the sender thread D2Hs on this channel
         # stream. Order the D2H after that producer work or it can read
@@ -266,6 +299,24 @@ class LwdNpuUcxChannelIo:
 
     def wait_ready(self, timeout: float | None = None) -> bool:
         return self._ch.wait_ready(timeout=timeout)
+
+    def force_teardown(self, reason: str) -> None:
+        """Linked teardown (control-plane restart verdict): tear the link
+        down at once — in-flight ops end with ERROR (the containment
+        catches them per request) and the connect side rebuilds. The
+        daemon port's fail detaches the session instead, so this stays an
+        embedded-mode operation."""
+        self._ch.fail(reason)
+
+    def on_peer_restart(self, cb: Callable[[], None]) -> None:
+        """Register the peer-restart hook (fires on the transport IO thread
+        when the handshake session changes at link adopt). Embedded mode
+        only: the port IS the channel there; the daemon protocol has no
+        cross-process restart event yet, so registration no-ops there."""
+        register = getattr(self._ch, "on_peer_restart", None)
+        if register is None:
+            return
+        register(cb)
 
     def shutdown(self, timeout: float = 2.0) -> None:
         self._stopped = True
@@ -347,7 +398,10 @@ class LwdNpuUcxChannelIo:
             event.set()
             if op.error is not None:
                 with contextlib.suppress(Exception):
-                    future._finalize(error=op.error)
+                    # Transport op errors are link-class: the consumers
+                    # classify LwdLinkError as transient (peer restart /
+                    # network outage) instead of a permanent failure.
+                    future._finalize(error=LwdLinkError(f"{self.tag} send failed: {op.error!r}"))
 
         return cb
 
@@ -382,7 +436,10 @@ class LwdNpuUcxChannelIo:
                 )
             if op.error is not None:
                 with contextlib.suppress(Exception):
-                    future._finalize(error=op.error)
+                    # Transport op errors are link-class: the consumers
+                    # classify LwdLinkError as transient (peer restart /
+                    # network outage) instead of a permanent failure.
+                    future._finalize(error=LwdLinkError(f"{tag_str} recv failed: {op.error!r}"))
                 return
             data = op.data
             try:
