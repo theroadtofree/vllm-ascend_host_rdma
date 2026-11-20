@@ -34,6 +34,7 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransf
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
     ConnectionId,
     LwdChannelType,
+    LwdLinkError,
     LwdTransferRequest,
     connection_from,
 )
@@ -64,6 +65,29 @@ _LWD_EARLY_RECV_LOOP_SLEEP_S = 0.002
 _LWD_EARLY_RECV_MAX_INFLIGHT = 2
 _LWD_HOST_STAGE_SLOTS = 2
 _LWD_SHUTDOWN_TIMEOUT_S = 5.0
+
+# The wire-layer peer-restart hook (registered at channel build time, when
+# no worker reference exists yet) reaches the endpoint worker through this
+# module singleton.
+_ENDPOINT_WORKER: LwdCloudWorker | None = None
+
+
+def drop_endpoint_early_recv(connection: ConnectionId) -> None:
+    """Hook target of the cloud's UP recv IO: drop one connection's
+    early-recv ledger after its edge restarted."""
+    worker = _ENDPOINT_WORKER
+    if worker is None:
+        lwd_logger.error("[LWD][pre-recv] early-recv drop MISS: no endpoint worker for %s", connection)
+        return
+    worker.drop_connection_early_recv(connection)
+
+
+def _link_error_cause(exc: BaseException) -> LwdLinkError | None:
+    """The transport link failure behind a future's RuntimeError wrapper,
+    or None for application-level errors (protocol violations and the
+    like), which keep the permanent failure path."""
+    cause = exc.__cause__ if isinstance(exc, RuntimeError) else exc
+    return cause if isinstance(cause, LwdLinkError) else None
 
 
 class LwdCloudWorker(LwdWorkerBase):
@@ -120,6 +144,8 @@ class LwdCloudWorker(LwdWorkerBase):
         self._lwd_up_num_hash_layers = hash_layer_count(self.model_config.hf_config)
         self._lwd_up_num_experts_per_tok = getattr(self.model_config.hf_config, "num_experts_per_tok", 0)
         if self._lwd_is_early_recv_endpoint:
+            global _ENDPOINT_WORKER
+            _ENDPOINT_WORKER = self
             self._lwd_init_lwd_host_stager()
             self._start_lwd_early_recv_thread()
         lwd_logger.info(
@@ -216,7 +242,17 @@ class LwdCloudWorker(LwdWorkerBase):
         meta = batch.batch_meta
         if meta is None or self._lwd_stager is None:
             return
-        if connection_from(meta) not in self._lwd_early_recv_connections:
+        connection = connection_from(meta)
+        if connection not in self._lwd_early_recv_connections:
+            # Only THIS branch is a drop: the carrier's connection is not
+            # one of this worker's (the normal loop below processes its
+            # own aborts and is not a drop).
+            lwd_logger.error(
+                "[LWD][cloud-worker] dropped abort notices reqs=%s: carrier connection=%s not in local connections=%s",
+                list(meta.aborted_req_ids or ()),
+                connection,
+                list(self._lwd_early_recv_connections),
+            )
             return
         for req_id in meta.aborted_req_ids or ():
             self._lwd_stager.abort_request(req_id)
@@ -309,6 +345,85 @@ class LwdCloudWorker(LwdWorkerBase):
             return None
         return done_mq.export_handle()
 
+    def lwd_attach_runtime_connection_mqs(
+        self, connection_id: ConnectionId, hint_handle_str: str | None = None
+    ) -> Handle | None:
+        """Runtime-added connection (elastic scale-out, C-4): attach the
+        hint MQ, create the done MQ, add both to the per-connection
+        dicts, and return the done MQ's handle for the engine's reader.
+
+        The hint MQ's handle arrives EXPLICITLY via the RPC argument:
+        env vars do NOT cross the MultiprocExecutor process boundary at
+        runtime (they only work at startup where workers inherit the
+        engine's env). Only the endpoint Worker (the one that runs the
+        early-recv thread with actual connections) does the work; others
+        return None.
+
+        Idempotent: an already-attached connection just returns its
+        existing done MQ handle."""
+        if not getattr(self, "_lwd_early_recv_connections", ()):
+            return None  # not the endpoint Worker
+        if connection_id in self._irecv_hint_mqs:
+            done_mq = self._irecv_done_mqs.get(connection_id)
+            if done_mq is not None:
+                return done_mq.export_handle()
+            return None
+        from vllm.distributed.device_communicators.shm_broadcast import (
+            MessageQueue,
+        )
+
+        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
+            _decode_handle,
+            create_report_mq,
+        )
+
+        if hint_handle_str is None:
+            return None  # the engine didn't pass the handle (wiring bug)
+        hint_mq = MessageQueue.create_from_handle(
+            _decode_handle(hint_handle_str), 0
+        )
+        done_mq = create_report_mq(connection_id)
+        self._irecv_hint_mqs[connection_id] = hint_mq
+        self._irecv_done_mqs[connection_id] = done_mq
+        return done_mq.export_handle()
+
+    def lwd_build_runtime_connection(self, conn: Any) -> bool | None:
+        """Build one runtime connection's UCX serve pair (elastic
+        scale-out, cloud_share C-3) and extend the worker's connection
+        state on EVERY TP rank. The EngineCore calls this via
+        ``collective_rpc`` on all Workers — the runner's
+        ``request_connection`` searches ``_lwd_connections`` by edge_id
+        on every rank, so the state extension cannot be endpoint-only.
+        The UCX build itself is endpoint-only (the listener owner);
+        others return None (``not my job``, distinct from False
+        ``build refused``)."""
+        from vllm_ascend.distributed.lwd_data_plane.host import lwd_host_channels
+
+        connection_id = conn.connection_id
+        # State extension on ALL Workers: the model runner on every TP
+        # rank resolves requests to connections via this tuple, and the
+        # harvest path subscripts _lwd_up_srcanks on every rank too.
+        if connection_id not in self._lwd_connections:
+            self._lwd_connections = (*self._lwd_connections, connection_id)
+            if hasattr(self, "_lwd_up_src_ranks"):
+                # Host comm maps every connection to the TP0 rank.
+                from vllm.distributed.parallel_state import get_tp_group
+
+                self._lwd_up_src_ranks[connection_id] = get_tp_group().ranks[0]
+
+        if not lwd_host_channels._UCX_LISTENERS:
+            return None  # not the endpoint Worker; state already extended
+        result = lwd_host_channels.lwd_add_runtime_connection(conn)
+        if result is True:
+            # Early-recv state: only the endpoint Worker consumes hints
+            # for this connection (the MQ attach RPC handles the MQs).
+            if connection_id not in self._lwd_early_recv_connections:
+                self._lwd_early_recv_connections = (
+                    *self._lwd_early_recv_connections,
+                    connection_id,
+                )
+        return result
+
     def _lwd_early_recv_loop(self) -> None:
         """Comm thread body: take hints -> pre-post recvs; poll futures ->
         report completions.
@@ -329,8 +444,17 @@ class LwdCloudWorker(LwdWorkerBase):
             self.device,
             "attached" if any(mq is not None for mq in self._irecv_hint_mqs.values()) else "none",
         )
-        hint_mqs = {connection: mq for connection, mq in self._irecv_hint_mqs.items() if mq is not None}
         while not self._lwd_early_recv_stop.is_set():
+            # Per-iteration snapshot: runtime-added connections (C-4)
+            # join the loop on the next tick. tuple(dict.items())
+            # completes in C — a Python-level iteration would raise on
+            # the engine thread's concurrent insert.
+            hint_mqs = dict(tuple(self._irecv_hint_mqs.items()))
+            hint_mqs = {
+                connection: mq
+                for connection, mq in hint_mqs.items()
+                if mq is not None
+            }
             for connection, hint_mq in hint_mqs.items():
                 if connection in self._early_recv_failed_connections:
                     continue
@@ -340,16 +464,27 @@ class LwdCloudWorker(LwdWorkerBase):
                 except TimeoutError:
                     continue
                 except Exception as exc:
-                    self._lwd_fail_early_recv_connection(connection, self._early_recv_error_seqno(connection), exc)
+                    self._lwd_route_early_recv_error(connection, self._early_recv_error_seqno(connection), exc)
                     time.sleep(_LWD_EARLY_RECV_ERROR_SLEEP_S)
             try:
                 self._report_irecv_completions()
             except Exception as exc:
                 key = self._early_recv_current_key
-                if key is None:
-                    raise
-                connection = key[0]
-                self._lwd_fail_early_recv_connection(connection, self._early_recv_error_seqno(connection), exc)
+                if key is not None:
+                    connection = key[0]
+                    self._lwd_route_early_recv_error(
+                        connection, self._early_recv_error_seqno(connection), exc
+                    )
+                else:
+                    # No active connection to attribute the failure to:
+                    # raising would kill the whole early-recv loop thread,
+                    # and inventing a connection would misroute the
+                    # verdict — log it and let the loop keep serving.
+                    lwd_logger.error(
+                        "[LWD][cloud-worker] early-recv completion report "
+                        "failed with no active connection: %r",
+                        exc,
+                    )
             if hint_mqs and all(connection in self._early_recv_failed_connections for connection in hint_mqs):
                 return
             # The ring's read side sched_yield-spins within the
@@ -368,6 +503,67 @@ class LwdCloudWorker(LwdWorkerBase):
             if key[0] == connection
         ]
         return min(candidates) if candidates else -1
+
+    def drop_connection_early_recv(self, connection: ConnectionId) -> None:
+        """Peer edge restarted: drop its early-recv ledger so the new edge's
+        from-zero hints are not judged 'already delivered' by a stale
+        watermark (the silent-reject hang). Unlike the failure path, the
+        connection is coming back: no failed marking, no data-plane abort."""
+        with self._early_recv_lock:
+            futures = [future for key, future in self._early_recv_futures.items() if key[0] == connection]
+            for key in list(self._early_recv_futures):
+                if key[0] == connection:
+                    self._early_recv_futures.pop(key, None)
+            for key in list(self._early_recv_pending):
+                if key[0] == connection:
+                    self._early_recv_pending.pop(key, None)
+            for key in list(self._early_recv_reserved):
+                if key[0] == connection:
+                    self._early_recv_reserved.discard(key)
+            self._early_recv_last_delivered.pop(connection, None)
+            if self._early_recv_current_key is not None and self._early_recv_current_key[0] == connection:
+                self._early_recv_current_key = None
+        for future in futures:
+            try:
+                future.release_device_tensor()
+            except Exception:
+                lwd_logger.exception("[LWD][pre-recv] failed to release receive tensor connection=%s", connection)
+        if self._lwd_stager is not None:
+            try:
+                self._lwd_stager.abandon_connection(connection)
+            except Exception:
+                lwd_logger.exception("[LWD][pre-recv] failed to clean host staging connection=%s", connection)
+        lwd_logger.error("[LWD][pre-recv] early-recv ledger dropped connection=%s (peer restarted)", connection)
+
+    def _lwd_route_early_recv_error(self, connection: ConnectionId, seqno: int, exc: Exception) -> None:
+        """Link-class transport failures stay transient (the peer is coming
+        back, no failed marking); application errors keep the permanent
+        failure path."""
+        if _link_error_cause(exc) is not None:
+            self._lwd_link_error_early_recv(connection, seqno, exc)
+        else:
+            self._lwd_fail_early_recv_connection(connection, seqno, exc)
+
+    def _lwd_link_error_early_recv(self, connection: ConnectionId, seqno: int, exc: Exception) -> None:
+        """Transient: the transport link broke (peer restart or network
+        outage). Drop the connection's ledger WITHOUT any failed marking —
+        it is coming back — and report a link_error so the engine retires
+        the connection's in-flight requests while leaving the connection
+        recoverable (the permanent path instead isolates it)."""
+        lwd_logger.error(
+            "[LWD][pre-recv] link error connection=%s seqno=%d: %r (transient)",
+            connection,
+            seqno,
+            exc,
+        )
+        self.drop_connection_early_recv(connection)
+        done_mq = self._irecv_done_mqs.get(connection, self._irecv_done_mq)
+        if done_mq is None:
+            return
+        try:
+            done_mq.enqueue((connection, "link_error", seqno, repr(exc)))
+        except Exception:
+            lwd_logger.exception("[LWD][pre-recv] failed to report link error connection=%s", connection)
 
     def _lwd_fail_early_recv_connection(self, connection: ConnectionId, seqno: int, exc: Exception) -> None:
         """Clean one failed peer and report it through the engine error ABI."""
@@ -615,7 +811,7 @@ class LwdCloudWorker(LwdWorkerBase):
                     done_mq.enqueue(("refill_done", req_id, nonce))
                 done_mq.enqueue((key, arrived))
             except Exception as exc:
-                self._lwd_fail_early_recv_connection(connection, seqno, exc)
+                self._lwd_route_early_recv_error(connection, seqno, exc)
                 blocked.add(connection)
                 continue
             finally:
