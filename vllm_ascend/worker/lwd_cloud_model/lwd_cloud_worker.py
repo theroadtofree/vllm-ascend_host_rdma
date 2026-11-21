@@ -382,7 +382,7 @@ class LwdCloudWorker(LwdWorkerBase):
         hint_mq = MessageQueue.create_from_handle(
             _decode_handle(hint_handle_str), 0
         )
-        done_mq = create_report_mq(connection_id)
+        done_mq = create_report_mq()
         self._irecv_hint_mqs[connection_id] = hint_mq
         self._irecv_done_mqs[connection_id] = done_mq
         return done_mq.export_handle()

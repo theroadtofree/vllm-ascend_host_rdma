@@ -81,6 +81,7 @@ def load_worker_methods():
         "_report_irecv_completions",
         "_lwd_up_post_recvs",
         "_lwd_cloud_flush_finished",
+        "lwd_attach_runtime_connection_mqs",
     }
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
     cls.bases = [ast.Name(id="Base", ctx=ast.Load())]
@@ -687,3 +688,35 @@ def test_watermark_gap_isolated_and_recovers_without_starvation(
     }
     assert not worker._early_recv_futures
     assert not worker._early_recv_pending
+
+
+def test_runtime_attach_connection_mqs_uses_zero_arg_report_factory(worker, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runtime MQ attachment must use the same zero-arg factory as startup."""
+    worker._lwd_early_recv_connections = (OTHER_CONNECTION,)
+    worker._irecv_hint_mqs = {}
+    worker._irecv_done_mqs = {}
+    hint_mq = object()
+    report_mq = NS(export_handle=lambda: "done-handle")
+    report_calls = []
+
+    def create_report_mq():
+        report_calls.append(())
+        return report_mq
+
+    monkeypatch.setattr(pre_recv, "create_report_mq", create_report_mq)
+    monkeypatch.setattr(pre_recv, "_decode_handle", lambda raw: raw)
+    message_queue = NS(create_from_handle=lambda handle, rank: hint_mq)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.device_communicators.shm_broadcast",
+        NS(MessageQueue=message_queue),
+    )
+
+    handle = worker.lwd_attach_runtime_connection_mqs(OTHER_CONNECTION, "hint-handle")
+
+    assert handle == "done-handle"
+    assert worker._irecv_hint_mqs[OTHER_CONNECTION] is hint_mq
+    assert worker._irecv_done_mqs[OTHER_CONNECTION] is report_mq
+    assert report_calls == [()]
+    assert worker.lwd_attach_runtime_connection_mqs(OTHER_CONNECTION, "hint-handle") == "done-handle"
+    assert report_calls == [()]
