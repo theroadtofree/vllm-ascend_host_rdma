@@ -224,6 +224,18 @@ class LwdNpuUcxChannelIo:
                 )
                 th.start()
                 self._copy_threads.append(th)
+        # One startup line per IO: the A/B run of 11-25 silently stayed on
+        # the device path because the topology carried no landing field,
+        # and nothing in the logs could prove which path was live. The mode
+        # is state, not trivia -- it must be readable from every log.
+        logger.error(
+            "[lwd-ucx] %s landing=%s%s",
+            self.tag,
+            "host" if self._landing_host else "device",
+            f" (copy pool armed, {_LANDING_POOL_THREADS} workers)"
+            if self._landing_host
+            else "",
+        )
         # Peer-restart recovery (embedded): the port IS the channel in
         # embedded mode, so the session-fingerprint restart event reaches
         # the queue/ledger resets registered by lwd_host_channels. The
