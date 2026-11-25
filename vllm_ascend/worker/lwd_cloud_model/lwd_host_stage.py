@@ -247,12 +247,18 @@ class LwdHostStager:
         max_numel: int = 0,
         empty_factory: LwdBufferFactory | None = None,
         device_factory: LwdBufferFactory | None = None,
+        device_slots: bool = True,
     ) -> None:
         if slots < 1:
-            raise ValueError(f"slots must be >= 1, got {slots}")
+            raise ValueError(f"slots must be >= 1")
         self.device = device
         self.slots = slots
         self.max_numel = max_numel
+        # False = host-landing mode (data_plane_host.landing: host): the
+        # frame never touches a device slot, so allocate lends only the
+        # slot PERMIT (the early-recv throttle) and returns None. Slot
+        # bookkeeping (busy/abandon/publish) is unchanged.
+        self.device_slots = device_slots
         self._empty_factory = empty_factory
         self._device_factory = device_factory
         self._lock = threading.Lock()
@@ -338,8 +344,9 @@ class LwdHostStager:
                 self._refill_done = [item for item in self._refill_done if item[0] != connection]
         return done
 
-    def allocate(self, seqno: LwdStageKey, numel: int) -> tuple[LwdBuffer, int]:
-        """Bind a free device slot to one receive sequence number."""
+    def allocate(self, seqno: LwdStageKey, numel: int) -> tuple[LwdBuffer | None, int]:
+        """Bind a free device slot (or, host-landing mode, only its permit)
+        to one receive sequence number."""
         with self._lock:
             if numel < 0 or (self.max_numel and numel > self.max_numel):
                 raise LwdHostStageGeometryError(f"seqno={seqno}: numel {numel} outside slot capacity {self.max_numel}")
@@ -352,13 +359,16 @@ class LwdHostStager:
                     f"(held by seqno={sorted(self._seqno_slot, key=_stage_sort_key)})"
                 )
             slot = free_slots[0]
-            buf = self._slot_buffers.get(slot)
-            if buf is None or buf.numel() < numel:
-                buf = self._make_device_buffer(self.max_numel or numel)
-                self._slot_buffers[slot] = buf
+            buf: LwdBuffer | None = None
+            if self.device_slots:
+                buf = self._slot_buffers.get(slot)
+                if buf is None or buf.numel() < numel:
+                    buf = self._make_device_buffer(self.max_numel or numel)
+                    self._slot_buffers[slot] = buf
+                buf = buf[:numel]
             self._slot_owner[slot] = seqno
             self._seqno_slot[seqno] = slot
-        return buf[:numel], slot
+        return buf, slot
 
     def abandon(self, seqno: LwdStageKey) -> None:
         """Roll back a plan and allocation whose receive was never posted."""

@@ -110,6 +110,7 @@ class _HostLinkPlan:
     down_block_mb: int
     qos: LwdQosDataPlane
     sidecar: bool
+    landing: str = "device"
 
 
 def lwd_data_plane_comm() -> str:
@@ -405,6 +406,7 @@ def lwd_init_host_channels() -> None:
         down_block_mb=down_block_mb,
         qos=qos,
         sidecar=_sidecar,
+        landing=getattr(_host_plane(), "landing", "device"),
     )
     for conn in endpoint_conns:
         _require_data_port(conn)
@@ -516,6 +518,18 @@ def _build_connection_ios(conn: LwdDPConnection, listener: LwdUcxListener | None
                     traffic_class=plan.qos.traffic_class,
                     sl=plan.qos.sl,
                     submit_wait_ready_s=LWD_SUBMIT_WAIT_READY_S,
+                    # Phase-2 host landing applies to the cloud's UP receive
+                    # only; every other IO pins the current device path (the
+                    # ucx_io gate re-checks channel/op/mode as a backstop).
+                    landing=(
+                        "host"
+                        if (
+                            plan.landing == "host"
+                            and plan.role == "cloud"
+                            and channel is LwdChannelType.UP
+                        )
+                        else "device"
+                    ),
                 ),
             )
             # Peer-restart recovery (embedded): the transport's session

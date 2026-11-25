@@ -137,6 +137,24 @@ class LwdHostTransferQueue(LwdTransferQueue):
         io: Any,
         into: LwdTransferFuture | None,
     ) -> LwdTransferFuture:
+        if getattr(io, "landing_host", False):
+            # Phase-2 host landing: no device buffer exists (the stager lent
+            # no slot buffer; the frame lands straight in the planned pinned
+            # segments) and the IO callback validates lengths from the
+            # request. Descramble has no host-side home yet -- refuse loudly
+            # instead of staging scrambled bytes silently.
+            seed = lwd_scramble_seed_for(req)
+            if seed is not None:
+                raise RuntimeError(
+                    f"channel {self.channel_type.value} seqno={req.seqno}: "
+                    "scramble is not supported with "
+                    "data_plane_host.landing=host (fold the descramble into "
+                    "the landing copy pool first)"
+                )
+            self._validate_stage_segments(req)
+            future = into or LwdTransferFuture(req, [], None)
+            io.submit_recv(req.seqno, req, None, None, future)
+            return future
         # Exact-size buffer, same contract as the HCCL queue (the sender's
         # frame length must match; the IO callback validates on arrival).
         buffer = req.recv_buffer

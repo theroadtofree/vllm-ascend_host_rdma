@@ -173,7 +173,25 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_up_num_hash_layers,
             self._lwd_up_num_experts_per_tok,
         )
-        self._lwd_stager = LwdHostStager(device=str(self.device), slots=_LWD_HOST_STAGE_SLOTS, max_numel=max_numel)
+        # Phase-2 host landing: when the topology selects
+        # data_plane_host.landing: host, the UP frame lands straight in the
+        # per-request pinned buffers (ucx_io's copy pool), so the stager
+        # lends only slot permits -- no device slot buffers.
+        self._lwd_stager = LwdHostStager(
+            device=str(self.device),
+            slots=_LWD_HOST_STAGE_SLOTS,
+            max_numel=max_numel,
+            device_slots=(self._lwd_up_landing() != "host"),
+        )
+
+    def _lwd_up_landing(self) -> str:
+        """UP receive landing mode from the topology ('device' | 'host').
+        getattr-chained: the field is newer than the wires that read it."""
+        lwd_config = getattr(self.vllm_config, "lwd_config", None)
+        topology = getattr(lwd_config, "topology", None)
+        deployment = getattr(topology, "deployment", None)
+        host_plane = getattr(deployment, "data_plane_host", None)
+        return getattr(host_plane, "landing", "device") if host_plane is not None else "device"
 
     def load_model(self) -> None:
         """Log the real layer split after loading: layer count / first-last

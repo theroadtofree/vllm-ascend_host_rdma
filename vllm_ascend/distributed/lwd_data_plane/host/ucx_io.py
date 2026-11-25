@@ -39,6 +39,7 @@ identical on both peers and verified per link at handshake.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import queue
 import threading
 import time
@@ -65,6 +66,11 @@ _PROBE_ON = probe_enabled()
 
 # Blocks per channel: absorbs the early frames and provides send backpressure.
 BLOCKS_PER_CHANNEL = 4
+# Host-landing copy pool: worker threads per UP-recv IO. The frame rate
+# caps the pool's work, so 4 absorbs bursts without stealing the IO thread
+# (the baseline probes pin the copy cost per frame; raise only if
+# landing_copy p95 tracks the pool, not the memory).
+_LANDING_POOL_THREADS = 4
 # Early frames that arrived before their receive was pre-posted. The old
 # branch allowed 4096; leaving this at LwdUcxConfig's default caps the store
 # at BLOCKS_PER_CHANNEL and silently drops the oldest frame on overflow.
@@ -102,6 +108,14 @@ class LwdNpuUcxChannelIoConfig:
     channel wiring; identical on both peers by construction); beyond it the
     submit proceeds and fails fast like any broken-link op."""
 
+    landing: Literal["device", "host"] = "device"
+    """UP receive landing mode (cloud UP-recv only; "device" everywhere
+    else). "device" = current path: H2D into a device slot, then D2H
+    staging into the per-request pinned buffers. "host" = the frame lands
+    straight in the pinned buffers through the copy pool (zero PCIe round
+    trip; requires in_process deployment, and stage_segments on every
+    receive; scramble is rejected on this path until it moves)."""
+
 
 class LwdNpuUcxChannelIo:
     """One (channel, op) LWD IO: LwdUcxChannel + sender thread + recv H2D.
@@ -126,6 +140,28 @@ class LwdNpuUcxChannelIo:
         for _probe_series in ("send_acq", "send_d2h", "send_post"):
             self._probe.series(_probe_series)
         self._stopped = False
+        # Host landing (Phase-2): only the cloud's UP receive qualifies.
+        # The edge's DOWN receive must keep the device path (its consumer
+        # wants a device tensor, no stage_segments), send IOs have no
+        # receive path, and the daemon transport hands shm views whose
+        # recycle goes through mark_recycle (not op.release_data) -- a
+        # host-landing daemon port is a later extension, not a fallback.
+        self._landing_host = (
+            config.landing == "host"
+            and config.op == "recv"
+            and channel is LwdChannelType.UP
+        )
+        if config.landing == "host" and not self._landing_host:
+            raise RuntimeError(
+                f"{self.tag}: landing=host is only valid on the cloud UP "
+                f"receive IO (got op={config.op!r} channel={channel.value}); "
+                "edge DOWN receives keep the device path"
+            )
+        if self._landing_host and config.transport_mode != "embedded":
+            raise RuntimeError(
+                f"{self.tag}: landing=host requires in_process deployment "
+                "(the daemon port's shm recycle path is a later extension)"
+            )
         if not config.token:
             raise RuntimeError(
                 f"{self.tag}: UCX handshake token is 0; ucx_channels must "
@@ -152,6 +188,10 @@ class LwdNpuUcxChannelIo:
             pool_staging=(config.op == "send"),
             traffic_class=config.traffic_class,
             sl=config.sl,
+            # Host landing rides on hold-recv: the library delivers the
+            # receive block itself (no bytes copy-out) and the copy pool
+            # reads it, releasing the block back when done.
+            hold_recv=self._landing_host,
         )
         # Transport executor: embedded = in-process direct LwdUcxChannel
         # (default); daemon = dedicated transport daemon (ucx_daemon +
@@ -166,6 +206,24 @@ class LwdNpuUcxChannelIo:
             listener=config.listener,
         )
         self._submit_wait_ready_s = config.submit_wait_ready_s
+        # Host-landing copy pool: the IO thread only enqueues; worker
+        # threads memmove the frame into the per-request pinned segments.
+        # The queue is the landing permit: its backlog plus the transport
+        # block pool bound the in-flight frames (the device-slot gate is
+        # gone in this mode).
+        self._copy_tasks: queue.Queue[tuple | None] | None = None
+        self._copy_threads: list[threading.Thread] = []
+        if self._landing_host:
+            self._probe.series("landing_copy")
+            self._copy_tasks = queue.Queue()
+            for _i in range(_LANDING_POOL_THREADS):
+                th = threading.Thread(
+                    target=self._copy_worker,
+                    name=f"lwd-ucx-cpy-{self.tag}-{_i}",
+                    daemon=True,
+                )
+                th.start()
+                self._copy_threads.append(th)
         # Peer-restart recovery (embedded): the port IS the channel in
         # embedded mode, so the session-fingerprint restart event reaches
         # the queue/ledger resets registered by lwd_host_channels. The
@@ -287,7 +345,9 @@ class LwdNpuUcxChannelIo:
                 self.tag,
                 seqno,
                 tag,
-                buffer.numel(),  # symbolic-meta-ok: log-only size, not a meta shape
+                # host landing passes no device buffer: report the planned
+                # numel from the request instead
+                buffer.numel() if buffer is not None else req.num_elements,  # symbolic-meta-ok: log-only size
                 aux_buffer.numel() if aux_buffer is not None else 0,  # symbolic-meta-ok: log-only size
                 req.stage_segments is not None,
             )
@@ -337,6 +397,9 @@ class LwdNpuUcxChannelIo:
         if self._send_thread is not None:
             self._sq.put(None)
             self._send_thread.join(timeout=timeout)
+        for _th in self._copy_threads:
+            # landing workers exit within one poll tick of _stopped
+            _th.join(timeout=timeout)
         self._ch.close(timeout=timeout)
         with self._skip_lock:
             self._skip_armed.clear()
@@ -484,6 +547,9 @@ class LwdNpuUcxChannelIo:
                     future._finalize(error=LwdLinkError(f"{tag_str} recv failed: {op.error!r}"))
                 return
             data = op.data
+            if self._landing_host:
+                self._landing_dispatch(op, data, req, future)
+                return
             try:
                 payload_len = self._nbytes(buffer)
                 aux_len = self._nbytes(aux_buffer) if aux_buffer is not None else 0
@@ -528,6 +594,126 @@ class LwdNpuUcxChannelIo:
                     future._finalize(error=exc)
 
         return cb
+
+    # ------------------------------------------------------------------ #
+    # Host landing: IO thread enqueues, copy pool memmoves into pinned      #
+    # ------------------------------------------------------------------ #
+    @property
+    def landing_host(self) -> bool:
+        """Whether this IO lands receives directly into pinned host buffers
+        (cloud UP-recv, Phase-2 mode). The queue reads this to skip its
+        device-buffer allocation."""
+        return self._landing_host
+
+    def _landing_dispatch(
+        self, op: Any, data: Any, req: Any, future: Any
+    ) -> None:
+        """IO-thread half of host landing: validate the frame, resolve its
+        host address, enqueue for the copy pool, and return immediately.
+
+        Frame layout (see _do_send): payload (bf16, main hash body + expert
+        tail packed) then aux (int64 mrope positions). The cloud data plane
+        has NO consumer for the aux tensor -- mrope reaches the runner via
+        the control plane (``_lwd_prime_mrope_positions``) -- so aux is
+        validated for the length check and deliberately not copied; a future
+        consumer must land it inside the copy pool, never on the IO thread.
+        """
+        payload_bytes = int(req.num_elements) * 2  # bf16 main+tail
+        aux_bytes = int(req.aux_num_elements) * 8  # int64 aux
+        if payload_bytes + aux_bytes != len(data):
+            err = ConnectionError(
+                f"payload size mismatch on {self.tag}: got {len(data)}B "
+                f"expect {payload_bytes}+{aux_bytes}"
+            )
+            future._finalize(error=err)
+            self._ch.fail(err)
+            op.release_data()
+            return
+        segments = req.stage_segments
+        if not segments:
+            err = RuntimeError(
+                f"host landing on {self.tag} requires req.stage_segments "
+                "(per-request pinned buffers must be planned before submit)"
+            )
+            future._finalize(error=err)
+            op.release_data()
+            return
+        for dst, _src_off, _numel in segments:
+            if dst.element_size() != 2:
+                err = RuntimeError(
+                    f"host landing segment dtype is {dst.dtype} on {self.tag}; "
+                    "the frame is packed bf16"
+                )
+                future._finalize(error=err)
+                op.release_data()
+                return
+        if op._blk is not None:
+            # held delivery: the receive block's registered memory
+            src = op._blk.addr
+        else:
+            # early-parked frame: standalone bytes owned by the early store;
+            # the future's keepalive holds them until finalize
+            src = ctypes.cast(ctypes.c_char_p(data), ctypes.c_void_p).value
+        tasks = self._copy_tasks
+        assert tasks is not None
+        tasks.put((src, data, segments, future, op))
+
+    def _copy_worker(self) -> None:
+        """Landing worker: memmove each segment straight into its pinned
+        slice (no torch, no GIL-heavy ops), bind a host completion event,
+        then release the held block back to the library."""
+        last_probe = 0.0
+        tasks = self._copy_tasks
+        assert tasks is not None
+        while True:
+            try:
+                task = tasks.get(timeout=0.05)
+            except queue.Empty:
+                task = None
+            if task is None:
+                if self._stopped:
+                    return
+                continue
+            src, keep, segments, future, op = task
+            try:
+                if _PROBE_ON:
+                    _t0 = time.perf_counter()
+                for dst, src_off, numel in segments:
+                    # segments are element-indexed into the bf16 frame
+                    ctypes.memmove(dst.data_ptr(), src + src_off * 2, numel * 2)
+                if _PROBE_ON:
+                    self._probe.series("landing_copy").add(time.perf_counter() - _t0)
+                    self._probe.count("landing_frames")
+                    self._probe.count("landing_bytes", sum(n * 2 for _, _, n in segments))
+                event = LwdHostDoneEvent()
+                # bind BEFORE set: the handle must be in place before the
+                # gate polls done(). keepalive only anchors the frame view
+                # for GC; the pinned destinations are the durable copy.
+                future._bind(
+                    handles=[],
+                    done_event=event,
+                    tensor=None,
+                    keepalive=(keep,),
+                    aux_tensor=None,
+                    staged_event=None,
+                )
+                event.set()
+            except Exception as exc:  # noqa: BLE001
+                with contextlib.suppress(Exception):
+                    future._finalize(
+                        error=RuntimeError(f"{self.tag} host landing copy failed: {exc!r}")
+                    )
+            finally:
+                # release in every outcome: a leaked held block drains the
+                # transport pool and stalls the sender (logged stuck by the
+                # library's IO loop after 5s)
+                op.release_data()
+                if _PROBE_ON:
+                    _now = time.monotonic()
+                    if _now - last_probe >= 10.0:
+                        for _probe_line in self._probe.take_lines():
+                            logger.error("[lwd-probe] %s", _probe_line)
+                        last_probe = _now
 
     def _stage_to_buffers(self, buffer: Any, req: Any, done_event: torch.npu.Event) -> torch.npu.Event:
         """D2H-copy the main frame per stage_segment into each request's
