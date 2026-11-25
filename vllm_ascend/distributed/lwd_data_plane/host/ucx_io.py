@@ -48,6 +48,7 @@ from typing import Any, Literal
 
 import torch
 from vllm.logger import logger
+from vllm.v1.lwd_comm.data_comm.lwd_probe import LwdProbeSet, probe_enabled
 from vllm.v1.lwd_comm.data_comm.ucx_channel import (
     LwdHostDoneEvent,
     LwdUcxConfig,
@@ -56,6 +57,11 @@ from vllm.v1.lwd_comm.data_comm.ucx_channel import (
 from vllm.v1.lwd_comm.data_comm.ucx_port import LwdUcxTransportPort, open_transport
 
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType, LwdLinkError
+
+# Phase-0 baseline probes (see vllm .../data_comm/lwd_probe.py): sender-side
+# occupancy (staging acquire wait / synchronous D2H / post); the recv-side
+# IO occupancy lives in ucx_channel itself. Same LWD_PROBE=0 kill switch.
+_PROBE_ON = probe_enabled()
 
 # Blocks per channel: absorbs the early frames and provides send backpressure.
 BLOCKS_PER_CHANNEL = 4
@@ -114,6 +120,11 @@ class LwdNpuUcxChannelIo:
         self._op = config.op
         self._stream = stream
         self.tag = f"{channel.value}/{config.op}"
+        # Phase-0 probe; token discriminates connections that share a channel
+        # name. Series pre-created so the sender thread never constructs.
+        self._probe = LwdProbeSet(f"{self.tag} token={config.token:#x}")
+        for _probe_series in ("send_acq", "send_d2h", "send_post"):
+            self._probe.series(_probe_series)
         self._stopped = False
         if not config.token:
             raise RuntimeError(
@@ -334,6 +345,7 @@ class LwdNpuUcxChannelIo:
     # Send: pool block (acquire_staging) -> direct D2H -> ch.send        #
     # ------------------------------------------------------------------ #
     def _sender_loop(self) -> None:
+        last_probe = 0.0
         while True:
             task = self._sq.get()
             if task is None:
@@ -345,6 +357,15 @@ class LwdNpuUcxChannelIo:
                 logger.exception("[lwd-ucx-trace] %s SEND_FAILED seqno=%s err=%r", self.tag, seqno, exc)
                 with contextlib.suppress(Exception):
                     future._finalize(error=exc)
+            if _PROBE_ON:
+                # flush cadence advances only while frames flow: a quiet
+                # interval reports nothing, and the counters of the next busy
+                # interval cover everything since the previous flush.
+                _now = time.monotonic()
+                if _now - last_probe >= 10.0:
+                    for _probe_line in self._probe.take_lines():
+                        logger.error("[lwd-probe] %s", _probe_line)
+                    last_probe = _now
 
     def _do_send(self, seqno: int | None, tensor: Any, aux_tensor: Any, future: Any) -> None:
         payload_bytes = self._nbytes(tensor)
@@ -358,10 +379,17 @@ class LwdNpuUcxChannelIo:
         # Library-pool staging block (pool depth = in-flight cap, i.e.
         # backpressure; blocks until one frees — the completion callback
         # releases it back; registration/rcache handled by the library).
+        if _PROBE_ON:
+            _t0 = time.perf_counter()
         stg = self._ch.acquire_staging()
+        if _PROBE_ON:
+            _t1 = time.perf_counter()
+            self._probe.series("send_acq").add(_t1 - _t0)
         sent = False
         try:
             tag = seqno if seqno is not None else _NO_SEQNO_TAG
+            if _PROBE_ON:
+                _t2 = time.perf_counter()
             t0 = time.monotonic()
             with torch.inference_mode(), torch.npu.stream(self._stream):
                 mv = memoryview(stg.buf)
@@ -370,6 +398,11 @@ class LwdNpuUcxChannelIo:
                 if aux_bytes:
                     adst = torch.frombuffer(mv[payload_bytes:total], dtype=aux_tensor.dtype)
                     adst.copy_(aux_tensor.reshape(adst.shape))
+            if _PROBE_ON:
+                # synchronous D2H into the staging block: this is the local
+                # machine's real PCIe D2H rate — the number the landing
+                # redesign compares host memcpy against.
+                self._probe.series("send_d2h").add(time.perf_counter() - _t2)
             if self._tr_d2h:
                 self._tr_d2h = False
                 logger.error(
@@ -384,7 +417,13 @@ class LwdNpuUcxChannelIo:
             # bind BEFORE send: the handle must be in place before the
             # completion callback (IO thread) sets the event.
             future._bind(handles=[], done_event=event)
+            if _PROBE_ON:
+                _t3 = time.perf_counter()
             self._ch.send(tag, stg.addr, total, ref=stg, cb=self._send_done(event, stg, future))
+            if _PROBE_ON:
+                self._probe.series("send_post").add(time.perf_counter() - _t3)
+                self._probe.count("send_frames")
+                self._probe.count("send_bytes", total)
             sent = True
         finally:
             if not sent:

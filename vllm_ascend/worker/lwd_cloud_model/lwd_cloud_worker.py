@@ -24,7 +24,13 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
 )
 from vllm.lwd_logger import lwd_logger
+from vllm.v1.lwd_comm.data_comm.lwd_probe import LwdProbeSet, probe_enabled
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+
+# Phase-0 baseline probe: submit -> published envelope of the early-recv
+# landing (quantised by this loop's poll cadence); same LWD_PROBE=0 switch
+# as the transport-side probes.
+_PROBE_ON = probe_enabled()
 
 # ops must initialize before the model_runner chain, otherwise device_op
 # and the ops package circularly import (mirrors worker.py's import order)
@@ -272,6 +278,13 @@ class LwdCloudWorker(LwdWorkerBase):
         self._early_recv_current_key: tuple[ConnectionId, LwdChannelType, int] | None = None
         self._early_recv_rr = 0
         self._early_recv_lock = threading.Lock()
+        # Phase-0 probe: cross-thread-safe series (hint threads submit, the
+        # report loop observes); t0 rides on each future as _lwd_probe_t0 so
+        # every failure/cleanup path frees it by GC, not by bookkeeping.
+        self._recv_probe = LwdProbeSet("cloud-recv")
+        self._recv_probe.series("landing", thread_safe=True)
+        self._recv_probe.series("staged_gap", thread_safe=True)
+        self._last_probe_flush = 0.0
         self._lwd_stager: LwdHostStager | None = None
         self._irecv_hint_mqs: dict[ConnectionId, Any] = {}
         self._irecv_done_mqs: dict[ConnectionId, Any] = {}
@@ -670,7 +683,11 @@ class LwdCloudWorker(LwdWorkerBase):
             prefix_nonces=fields.prefix_nonces,
         )
         request = self._lwd_build_up_recv_request(fields, recv_buffer, segments)
-        return lwd_get_data_plane().submit_recv(request)
+        future = lwd_get_data_plane().submit_recv(request)
+        if _PROBE_ON:
+            # envelope start: read at publish time in _report_irecv_completions
+            future._lwd_probe_t0 = time.perf_counter()
+        return future
 
     def _early_recv_quota(self, connections: list[ConnectionId]) -> int:
         """Soft per-connection share; unused capacity remains work conserving."""
@@ -797,6 +814,10 @@ class LwdCloudWorker(LwdWorkerBase):
                 if not future.done():
                     blocked.add(connection)
                     continue
+                if _PROBE_ON and getattr(future, "_lwd_probe_done_t0", 0.0) == 0.0:
+                    # done_event observed (wire + H2D into the device slot):
+                    # staged_gap then measures the D2H-unload segment alone.
+                    future._lwd_probe_done_t0 = time.perf_counter()
                 future.result()
                 if not future.staged_done():
                     blocked.add(connection)
@@ -804,6 +825,14 @@ class LwdCloudWorker(LwdWorkerBase):
                 future.result()
                 stage_key = (connection, seqno)
                 published = stager.publish_received(stage_key)
+                if _PROBE_ON:
+                    _t_submit = getattr(future, "_lwd_probe_t0", None)
+                    if _t_submit is not None:
+                        _now = time.perf_counter()
+                        self._recv_probe.series("landing").add(_now - _t_submit)
+                        _done_t0 = getattr(future, "_lwd_probe_done_t0", 0.0)
+                        if _done_t0:
+                            self._recv_probe.series("staged_gap").add(_now - _done_t0)
                 stager.release_if_drained(stage_key)
                 arrived = [(req_id, offset + rows) for req_id, rows, offset in published]
                 future.release_device_tensor()
@@ -827,6 +856,12 @@ class LwdCloudWorker(LwdWorkerBase):
                 seqno,
                 arrived,
             )
+        if _PROBE_ON:
+            _now = time.monotonic()
+            if _now - self._last_probe_flush >= 10.0:
+                for _probe_line in self._recv_probe.take_lines():
+                    lwd_logger.error("[Lwd][probe] %s", _probe_line)
+                self._last_probe_flush = _now
         self._early_recv_pump()
 
     @torch.inference_mode()
