@@ -400,6 +400,13 @@ class LwdCloudWorker(LwdWorkerBase):
         from vllm_ascend.distributed.lwd_data_plane.host import lwd_host_channels
 
         connection_id = conn.connection_id
+        if connection_id.dp_idx != self._lwd_dp_idx:
+            # Another DP rank's connection: only the connection's own
+            # DP engine may extend state or build a serve pair for it.
+            # Extending here anyway adds a second id per edge to
+            # _lwd_connections and breaks the runner's per-edge
+            # connection uniqueness on a multi-DP cloud.
+            return None
         # State extension on ALL Workers: the model runner on every TP
         # rank resolves requests to connections via this tuple, and the
         # harvest path subscripts _lwd_up_srcanks on every rank too.
