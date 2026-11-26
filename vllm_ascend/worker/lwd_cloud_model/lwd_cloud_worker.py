@@ -70,6 +70,14 @@ _LWD_EARLY_RECV_ERROR_SLEEP_S = 0.01
 _LWD_EARLY_RECV_LOOP_SLEEP_S = 0.002
 _LWD_EARLY_RECV_MAX_INFLIGHT = 2
 _LWD_HOST_STAGE_SLOTS = 2
+# Host-landing pump depth: the stager "slot" is a pure throttle permit
+# there (no device buffer), and the 11-25 landing run showed the
+# 2-permit / 2-inflight cap losing the pre-post race to burst arrivals
+# (worst 10s window: 11 of 14 frames early). Permits free at publish, so
+# a deeper cap absorbs scheduling bursts; device mode keeps the real
+# 2-slot memory bound.
+_LWD_HOST_LANDING_PERMITS = 4
+_LWD_EARLY_RECV_MAX_INFLIGHT_HOST_LANDING = 4
 _LWD_SHUTDOWN_TIMEOUT_S = 5.0
 
 # The wire-layer peer-restart hook (registered at channel build time, when
@@ -166,7 +174,7 @@ class LwdCloudWorker(LwdWorkerBase):
 
     def _lwd_init_lwd_host_stager(self) -> None:
         """Create endpoint host staging with fixed limits."""
-        self._early_recv_max_inflight = _LWD_EARLY_RECV_MAX_INFLIGHT
+        self._early_recv_max_inflight = self._lwd_early_recv_inflight_cap()
         max_numel = hash_payload_numel(
             self.vllm_config.scheduler_config.max_num_batched_tokens,
             self._lwd_up_hidden_size,
@@ -176,13 +184,24 @@ class LwdCloudWorker(LwdWorkerBase):
         # Phase-2 host landing: when the topology selects
         # data_plane_host.landing: host, the UP frame lands straight in the
         # per-request pinned buffers (ucx_io's copy pool), so the stager
-        # lends only slot permits -- no device slot buffers.
+        # lends only slot permits -- no device slot buffers -- and the pump
+        # runs at the deeper host-landing cap (see the constants block).
+        landing = self._lwd_up_landing()
+        permits = _LWD_HOST_LANDING_PERMITS if landing == "host" else _LWD_HOST_STAGE_SLOTS
         self._lwd_stager = LwdHostStager(
             device=str(self.device),
-            slots=_LWD_HOST_STAGE_SLOTS,
+            slots=permits,
             max_numel=max_numel,
-            device_slots=(self._lwd_up_landing() != "host"),
+            device_slots=(landing != "host"),
         )
+
+    def _lwd_early_recv_inflight_cap(self) -> int:
+        """Early-recv pump in-flight cap, landing-aware (host landing
+        throttles with cheap permits; device mode keeps the slot-memory
+        bound)."""
+        if self._lwd_up_landing() == "host":
+            return _LWD_EARLY_RECV_MAX_INFLIGHT_HOST_LANDING
+        return _LWD_EARLY_RECV_MAX_INFLIGHT
 
     def _lwd_up_landing(self) -> str:
         """UP receive landing mode from the topology ('device' | 'host').
@@ -287,7 +306,7 @@ class LwdCloudWorker(LwdWorkerBase):
 
     def _init_lwd_early_recv_state(self) -> None:
         """Initialize queued, submitted, and delivered UP receive state."""
-        self._early_recv_max_inflight = _LWD_EARLY_RECV_MAX_INFLIGHT
+        self._early_recv_max_inflight = self._lwd_early_recv_inflight_cap()
         self._early_recv_futures: dict[tuple[ConnectionId, LwdChannelType, int], LwdTransferFuture] = {}
         self._early_recv_pending: dict[tuple[ConnectionId, LwdChannelType, int], dict[str, Any]] = {}
         self._early_recv_reserved: set[tuple[ConnectionId, LwdChannelType, int]] = set()

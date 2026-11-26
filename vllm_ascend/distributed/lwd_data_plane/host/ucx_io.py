@@ -381,7 +381,17 @@ class LwdNpuUcxChannelIo:
         if discard is not None:
             discard(seqno)
         else:
-            self._ch.recv(seqno, cb=lambda op: None)
+            # embedded: the discard may pair with a block-held delivery
+            # (held early-park frame, or held frame delivered at arrival) --
+            # a discard consumer never copies, so the block must go back
+            # right in the callback or it leaks (pool drains, sender
+            # stalls). release_data is a no-op for standalone-bytes ops.
+            def _discard(op: Any) -> None:
+                release = getattr(op, "release_data", None)
+                if release is not None:
+                    release()
+
+            self._ch.recv(seqno, cb=_discard)
 
     def wait_ready(self, timeout: float | None = None) -> bool:
         return self._ch.wait_ready(timeout=timeout)
