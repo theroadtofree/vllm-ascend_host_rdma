@@ -14,7 +14,7 @@ Layering and responsibilities:
     restarting the deployment (sidecar/daemon mode keeps the
     whole-deployment-restart semantics — the daemon protocol has no restart
     event).
-  * send: sender thread + library-pool staging -- ``ch.acquire_staging()`` takes
+  * send: D2H workers + poster thread + library-pool staging -- the workers take
     a pool block (pool_staging: the channel's pool blocks are not attached to
     the wildcard, they serve purely as D2H staging), one D2H copy writes
     directly into it, then ``ch.send(tag, blk.addr)``; the completion callback
@@ -71,6 +71,12 @@ BLOCKS_PER_CHANNEL = 4
 # (the baseline probes pin the copy cost per frame; raise only if
 # landing_copy p95 tracks the pool, not the memory).
 _LANDING_POOL_THREADS = 4
+# D2H workers per send IO: each performs the BLOCKING D2H exactly as the
+# old single-threaded sender did; two suffice because the channel stream
+# serializes the copies anyway -- the second worker's job is to have the
+# next copy already enqueued while the first is stalled on the producer
+# stream's backlog (see __init__).
+_D2H_WORKERS = 2
 # Early frames that arrived before their receive was pre-posted. The old
 # branch allowed 4096; leaving this at LwdUcxConfig's default caps the store
 # at BLOCKS_PER_CHANNEL and silently drops the oldest frame on overflow.
@@ -118,7 +124,7 @@ class LwdNpuUcxChannelIoConfig:
 
 
 class LwdNpuUcxChannelIo:
-    """One (channel, op) LWD IO: LwdUcxChannel + sender thread + recv H2D.
+    """One (channel, op) LWD IO: LwdUcxChannel + D2H workers/poster + recv H2D.
 
     Roles: the edge connects (host, port); the cloud serves (serve=True,
     host, port) — i.e. the RECEIVER of a (channel, op) link serves.
@@ -135,9 +141,9 @@ class LwdNpuUcxChannelIo:
         self._stream = stream
         self.tag = f"{channel.value}/{config.op}"
         # Phase-0 probe; token discriminates connections that share a channel
-        # name. Series pre-created so the sender thread never constructs.
+        # name. Series pre-created so no worker/poster thread ever constructs.
         self._probe = LwdProbeSet(f"{self.tag} token={config.token:#x}")
-        for _probe_series in ("send_acq", "send_d2h", "send_post"):
+        for _probe_series in ("send_acq", "send_d2h", "send_post", "send_handoff"):
             self._probe.series(_probe_series)
         self._stopped = False
         # Host landing (Phase-2): only the cloud's UP receive qualifies.
@@ -242,14 +248,44 @@ class LwdNpuUcxChannelIo:
         # daemon protocol has no cross-process restart event yet, so the
         # registration below no-ops there (sidecar keeps the
         # whole-deployment-restart semantics).
-        # Send direction: task queue + sender thread (staging blocks come
-        # from the library pool via ch.acquire_staging; this layer never
-        # allocates its own memory/MR).
+        # Send direction: task queue -> D2H workers -> in-order gate -> poster.
+        # Staging blocks come from the library pool via ch.acquire_staging;
+        # this layer never allocates its own memory/MR. The blocking D2H
+        # waits on the producer stream's backlog (data readiness -- the
+        # snapshot clone runs behind the producing forward step), so the
+        # baseline showed the sender thread stalled in it for ~50% of wall
+        # time (med p50 66ms, max 806ms): one blocking copy head-of-line
+        # blocked every later frame's wire post. The split below keeps the
+        # copy semantics EXACTLY as before (still a blocking pageable D2H
+        # -- no bet on torch_npu's async behavior) but moves the wait off
+        # the posting path: two workers absorb the sync copies in parallel,
+        # and the poster thread fires each wire post the moment its frame
+        # reaches the gate in submit order.
         self._sq: queue.Queue[tuple | None] = queue.Queue()
-        self._send_thread: threading.Thread | None = None
+        self._send_threads: list[threading.Thread] = []
+        # in-order gate: submit order is FIFO and the poster preserves it
+        # (wire posts in seqno order, exactly as the single-threaded path
+        # did); D2H copies may complete out of order across the workers.
+        self._d2h_cond = threading.Condition()
+        self._d2h_next_seq = 0  # assigns submit order to dequeued tasks
+        self._d2h_done: dict[int, tuple | None] = {}  # seq -> frame or failed slot
+        self._d2h_post_next = 0
         if config.op == "send":
-            self._send_thread = threading.Thread(target=self._sender_loop, name=f"lwd-ucx-send-{self.tag}", daemon=True)
-            self._send_thread.start()
+            for _i in range(_D2H_WORKERS):
+                th = threading.Thread(
+                    target=self._d2h_worker_loop,
+                    name=f"lwd-ucx-d2h-{self.tag}-{_i}",
+                    daemon=True,
+                )
+                th.start()
+                self._send_threads.append(th)
+            poster = threading.Thread(
+                target=self._post_loop,
+                name=f"lwd-ucx-send-{self.tag}",
+                daemon=True,
+            )
+            poster.start()
+            self._send_threads.append(poster)
         # skip arming (only meaningful on the recv side)
         self._skip_armed: set[int] = set()
         self._skip_lock = threading.Lock()
@@ -316,17 +352,20 @@ class LwdNpuUcxChannelIo:
     ) -> None:
         # Fast fail on the edge: a frame larger than the negotiated block
         # can never reach the cloud. Queueing it would leave the request
-        # awaiting forever because _do_send only finalizes the future.
+        # awaiting forever because the D2H worker only finalizes the future.
         self._raise_if_frame_too_large(seqno, tensor, aux_tensor)
         # Absorb the reconnect window (peer restart / network break): a
         # send landing inside the gap would fail its op fail-fast.
         self._wait_reconnect_window()
-        # The caller enqueues the snapshot clone asynchronously on the
-        # producer stream, while the sender thread D2Hs on this channel
-        # stream. Order the D2H after that producer work or it can read
-        # half-written bytes under back-to-back submits.
         producer = torch.npu.current_stream()
         self._stream.wait_stream(producer)
+        # Gate ticket, stamped on the submitter's thread: one submitter per
+        # IO (the queue's submission lock), so FIFO submit order == ticket
+        # order. The workers may finish copies out of ticket order; the
+        # poster re-establishes the submit order for the wire.
+        with self._d2h_cond:
+            gate_seq = self._d2h_next_seq
+            self._d2h_next_seq += 1
         if self._tr_submit_send:
             self._tr_submit_send = False
             logger.error(
@@ -337,7 +376,7 @@ class LwdNpuUcxChannelIo:
                 (self._nbytes(aux_tensor) if aux_tensor is not None else 0),
                 self._sq.qsize(),
             )
-        self._sq.put((seqno, tensor, aux_tensor, future))
+        self._sq.put((seqno, tensor, aux_tensor, future, gate_seq))
 
     def submit_recv(
         self,
@@ -416,9 +455,30 @@ class LwdNpuUcxChannelIo:
 
     def shutdown(self, timeout: float = 2.0) -> None:
         self._stopped = True
-        if self._send_thread is not None:
-            self._sq.put(None)
-            self._send_thread.join(timeout=timeout)
+        if self._send_threads:
+            # one sentinel per D2H worker; the poster exits on its own poll
+            for _ in range(_D2H_WORKERS):
+                self._sq.put(None)
+            for _th in self._send_threads:
+                _th.join(timeout=timeout)
+            # frames the workers finished but the poster never reached, and
+            # frames still queued: fail their futures, return their staging
+            with self._d2h_cond:
+                leftovers = [entry for entry in self._d2h_done.values() if entry is not None]
+                self._d2h_done.clear()
+            while True:
+                try:
+                    task = self._sq.get_nowait()
+                except queue.Empty:
+                    break
+                if task is not None:
+                    with contextlib.suppress(Exception):
+                        task[3]._finalize(error=RuntimeError("io shut down before D2H"))
+            for stg, _tag, _total, future, _t0 in leftovers:
+                with contextlib.suppress(Exception):
+                    self._ch.release_staging(stg)
+                with contextlib.suppress(Exception):
+                    future._finalize(error=RuntimeError("io shut down before wire post"))
         for _th in self._copy_threads:
             # landing workers exit within one poll tick of _stopped
             _th.join(timeout=timeout)
@@ -427,50 +487,58 @@ class LwdNpuUcxChannelIo:
             self._skip_armed.clear()
 
     # ------------------------------------------------------------------ #
-    # Send: pool block (acquire_staging) -> direct D2H -> ch.send        #
+    # Send: D2H workers (blocking copy) -> in-order gate -> poster        #
     # ------------------------------------------------------------------ #
-    def _sender_loop(self) -> None:
-        last_probe = 0.0
+    def _d2h_worker_loop(self) -> None:
+        """Consume the submit queue, run the BLOCKING D2H into a library
+        staging block (semantics identical to the old single-threaded
+        sender -- the pageable destination keeps torch's sync copy, no bet
+        on async behavior), then hand the finished frame to the in-order
+        gate. The wait is data readiness (the producer stream's backlog
+        behind the snapshot clone); a second worker exists so the NEXT
+        frame's copy is already enqueued while the first stalls."""
         while True:
             task = self._sq.get()
             if task is None:
-                break
-            seqno, tensor, aux_tensor, future = task
+                return
+            seqno, tensor, aux_tensor, future, seq = task  # gate ticket stamped at submit
             try:
-                self._do_send(seqno, tensor, aux_tensor, future)
+                stg, tag, total = self._do_d2h(seqno, tensor, aux_tensor)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("[lwd-ucx-trace] %s SEND_FAILED seqno=%s err=%r", self.tag, seqno, exc)
                 with contextlib.suppress(Exception):
                     future._finalize(error=exc)
-            if _PROBE_ON:
-                # flush cadence advances only while frames flow: a quiet
-                # interval reports nothing, and the counters of the next busy
-                # interval cover everything since the previous flush.
-                _now = time.monotonic()
-                if _now - last_probe >= 10.0:
-                    for _probe_line in self._probe.take_lines():
-                        logger.error("[lwd-probe] %s", _probe_line)
-                    last_probe = _now
+                # a failed frame still occupies its gate slot, or the poster
+                # would block forever on a hole in the submit order
+                with self._d2h_cond:
+                    self._d2h_done[seq] = None
+                    self._d2h_cond.notify_all()
+                continue
+            with self._d2h_cond:
+                self._d2h_done[seq] = (stg, tag, total, future, time.perf_counter())
+                self._d2h_cond.notify_all()
 
-    def _do_send(self, seqno: int | None, tensor: Any, aux_tensor: Any, future: Any) -> None:
+    def _do_d2h(
+        self, seqno: int | None, tensor: Any, aux_tensor: Any
+    ) -> tuple[Any, int, int]:
+        """Blocking D2H into a library-pool staging block (pool depth =
+        in-flight cap, i.e. backpressure; blocks until one frees -- the
+        send completion callback releases it back; registration/rcache
+        handled by the library). Returns (stg, tag, total)."""
         payload_bytes = self._nbytes(tensor)
         aux_bytes = self._nbytes(aux_tensor) if aux_tensor is not None else 0
         total = payload_bytes + aux_bytes
         if total > self._block_bytes:
-            # Defensive: submit_send already rejects this; keep the sender
-            # path consistent if a frame is enqueued by another caller.
+            # Defensive: submit_send already rejects this; the worker only
+            # fails loudly, it never posts an oversized frame.
             self._raise_if_frame_too_large(seqno, tensor, aux_tensor)
-            return
-        # Library-pool staging block (pool depth = in-flight cap, i.e.
-        # backpressure; blocks until one frees — the completion callback
-        # releases it back; registration/rcache handled by the library).
+            raise RuntimeError(f"{self.tag} seqno={seqno}: oversized frame reached the D2H worker")
         if _PROBE_ON:
             _t0 = time.perf_counter()
         stg = self._ch.acquire_staging()
         if _PROBE_ON:
             _t1 = time.perf_counter()
             self._probe.series("send_acq").add(_t1 - _t0)
-        sent = False
         try:
             tag = seqno if seqno is not None else _NO_SEQNO_TAG
             if _PROBE_ON:
@@ -484,9 +552,9 @@ class LwdNpuUcxChannelIo:
                     adst = torch.frombuffer(mv[payload_bytes:total], dtype=aux_tensor.dtype)
                     adst.copy_(aux_tensor.reshape(adst.shape))
             if _PROBE_ON:
-                # synchronous D2H into the staging block: this is the local
-                # machine's real PCIe D2H rate — the number the landing
-                # redesign compares host memcpy against.
+                # blocking D2H: data-readiness wait (producer backlog) plus
+                # the copy -- the same number the single-threaded baseline
+                # measured, now absorbed by a worker, off the posting path.
                 self._probe.series("send_d2h").add(time.perf_counter() - _t2)
             if self._tr_d2h:
                 self._tr_d2h = False
@@ -498,21 +566,66 @@ class LwdNpuUcxChannelIo:
                     seqno,
                     (time.monotonic() - t0) * 1000,
                 )
+            return stg, tag, total
+        except Exception:
+            self._ch.release_staging(stg)
+            raise
+
+    def _post_loop(self) -> None:
+        """Wire posts in submit order (FIFO -- exactly the single-threaded
+        semantics). The poster never blocks on the device: it fires each
+        send the instant its frame crosses the gate, while the D2H workers
+        may still be stalled on later frames' readiness."""
+        last_probe = 0.0
+        while True:
+            with self._d2h_cond:
+                # a failed frame occupies its slot with None; the `in` test
+                # (not a sentinel-default pop) tells "not ready yet" apart
+                # from "failed", or a hole would wedge the gate forever
+                if self._d2h_post_next not in self._d2h_done:
+                    self._d2h_cond.wait(timeout=0.005)
+                    if self._stopped:
+                        return
+                    continue
+                entry = self._d2h_done.pop(self._d2h_post_next)
+                self._d2h_post_next += 1
+            if entry is None:
+                continue  # a failed frame's slot: gate advances, nothing posts
+            stg, tag, total, future, done_t0 = entry
+            if _PROBE_ON:
+                # gate wait: copy-complete -> wire post; non-zero means the
+                # poster was held behind an earlier frame (in-order FIFO)
+                self._probe.series("send_handoff").add(time.perf_counter() - done_t0)
             event = LwdHostDoneEvent()
             # bind BEFORE send: the handle must be in place before the
             # completion callback (IO thread) sets the event.
             future._bind(handles=[], done_event=event)
+            posted = False
+            try:
+                if _PROBE_ON:
+                    _t3 = time.perf_counter()
+                self._ch.send(tag, stg.addr, total, ref=stg, cb=self._send_done(event, stg, future))
+                if _PROBE_ON:
+                    self._probe.series("send_post").add(time.perf_counter() - _t3)
+                    self._probe.count("send_frames")
+                    self._probe.count("send_bytes", total)
+                posted = True
+            except Exception as exc:  # noqa: BLE001
+                with contextlib.suppress(Exception):
+                    future._finalize(error=exc)
+            finally:
+                if not posted:
+                    with contextlib.suppress(Exception):
+                        self._ch.release_staging(stg)
             if _PROBE_ON:
-                _t3 = time.perf_counter()
-            self._ch.send(tag, stg.addr, total, ref=stg, cb=self._send_done(event, stg, future))
-            if _PROBE_ON:
-                self._probe.series("send_post").add(time.perf_counter() - _t3)
-                self._probe.count("send_frames")
-                self._probe.count("send_bytes", total)
-            sent = True
-        finally:
-            if not sent:
-                self._ch.release_staging(stg)
+                # flush cadence advances only while frames flow: a quiet
+                # interval reports nothing, and the counters of the next busy
+                # interval cover everything since the previous flush.
+                _now = time.monotonic()
+                if _now - last_probe >= 10.0:
+                    for _probe_line in self._probe.take_lines():
+                        logger.error("[lwd-probe] %s", _probe_line)
+                    last_probe = _now
 
     def _send_done(self, event: LwdHostDoneEvent, stg: Any, future: Any) -> Callable[[Any], None]:
         def cb(op) -> None:  # noqa: ANN001 - LwdUcxOp (lib IO thread)
@@ -633,7 +746,7 @@ class LwdNpuUcxChannelIo:
         """IO-thread half of host landing: validate the frame, resolve its
         host address, enqueue for the copy pool, and return immediately.
 
-        Frame layout (see _do_send): payload (bf16, main hash body + expert
+        Frame layout (see _do_d2h): payload (bf16, main hash body + expert
         tail packed) then aux (int64 mrope positions). The cloud data plane
         has NO consumer for the aux tensor -- mrope reaches the runner via
         the control plane (``_lwd_prime_mrope_positions``) -- so aux is
